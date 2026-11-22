@@ -239,6 +239,8 @@ Select **Create group**.
  
 Review the confirmation information and approve the operation.
  
+For PIM-enabled groups, the application waits 10 seconds after group creation for Microsoft Entra directory propagation before applying PIM settings.
+
 For PIM-enabled groups, the application automatically adds the following warning to the beginning of the group description:
  
 ```text

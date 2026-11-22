@@ -80,9 +80,10 @@
     settings, and select Apply PIM to existing group. This action does not
     create a group, assign roles, or add eligible members.
  
-    Policy settings are read back after updates. Verify the resulting settings
-    and eligible assignments in Entra PIM. Policy-related 404 responses are
-    retried for a limited time; other errors are reported.
+    PIM configuration for newly created groups waits 10 seconds for directory
+    propagation. Policy settings are read back after updates. Verify the
+    resulting settings and eligible assignments in Entra PIM. Policy-related
+    404 responses are retried for a limited time; other errors are reported.
  
     The GUI creates an audit log in Documents by default. Browse to choose
     another .log file; existing files are appended after confirmation.
@@ -1197,6 +1198,9 @@ function Invoke-CreateGroupWorkflow
     {
         try
         {
+            $PropagationDelaySeconds = 10
+            Write-UiLog "Waiting $PropagationDelaySeconds seconds for Microsoft Entra propagation before configuring PIM for '$($Configuration.GroupName)' [$($Group.id)]."
+            Start-Sleep -Seconds $PropagationDelaySeconds
             Set-PimMemberSettings -GroupId $Group.id -Configuration $Configuration
             $Result.Details += ' PIM Member settings configured and verified.'
  
@@ -2041,7 +2045,7 @@ ONE GROUP
 3. For dynamic groups, choose User or Device and enter an Entra membership rule. Entra validates the rule.
 4. For a PIM group, review the Member policy settings. Defaults are 8-hour activation, MFA, 365-day eligible assignments, no permanent active assignments, and MFA plus justification for active assignments.
 5. Optionally enter user UPNs to assign as PIM-eligible members. This does not make them active members.
-6. Click Create group and confirm. Review the outcome in the log.
+6. Click Create group and confirm. Newly created PIM groups wait 10 seconds for Microsoft Entra propagation before PIM settings are applied. Review the outcome in the log.
  
 RETRY PIM SETTINGS ON AN EXISTING GROUP
 1. Select the PIM-enabled role-assignable group type and enter the existing group object ID.
