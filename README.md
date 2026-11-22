@@ -83,6 +83,8 @@ powershell.exe -STA -NoProfile -File ".\PIM-Group-Manager.ps1"
  
 The `-STA` option is required for the graphical interface.
  
+Select **How to use** in the main window header to open the instructions in a separate window. The help window closes with the main application.
+
 ---
  
 ## Connect to Microsoft Entra
@@ -112,13 +114,13 @@ When you are finished using the tool, select **Disconnect**.
  
 PIM Group Manager keeps a local audit log of activity performed through the application.
  
-Each session creates a unique log file in the user's **Documents** folder using a name similar to:
+The default log is saved in the user's **Documents** folder with a name in this format:
  
 ```text
-PIM-Group-Manager-<timestamp>-<session>.log
+YYYY-MM-DD_HHmm-PIM-Group-Manager.log
 ```
  
-The log file is created when the application starts.
+If the default log already exists, new entries are appended. Sessions started during the same minute share the file; each entry includes a session ID. The log file is created when the application starts.
  
 ### Changing the Log Location
  
@@ -267,13 +269,13 @@ Instead:
  
 1. Connect to the same Microsoft Entra tenant.
 2. Select **PIM-enabled security (role-assignable)**.
-3. Enter the existing group's **Object ID** in **Existing group ID**.
+3. Enter the existing group's exact display name or **Object ID**. If multiple groups have the same display name, use the Object ID.
 4. Review the PIM Member settings.
 5. Select **Apply PIM to existing group**.
 6. Carefully review the retrieved group name and Object ID.
 7. Confirm the operation.
  
-After creating a single group, the application automatically places the new group's Object ID into the **Existing group ID** field.
+After creating a single group, the application automatically places the new group's Object ID into the **Existing group name or ID** field.
  
 For groups created through bulk creation, the Object ID is included in the results file.
  

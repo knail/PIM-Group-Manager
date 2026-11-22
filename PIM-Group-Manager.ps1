@@ -76,8 +76,9 @@
     separate operations. A failure may leave a group or partial changes in
     place. Review the log and Entra PIM before retrying.
  
-    To retry PIM settings, enter the existing group object ID, review the
-    settings, and select Apply PIM to existing group. This action does not
+    To retry PIM settings, enter the existing group's exact display name or
+    object ID, review the settings, and select Apply PIM to existing group.
+    If multiple groups share a name, use the object ID. This action does not
     create a group, assign roles, or add eligible members.
  
     PIM configuration for newly created groups waits 10 seconds for directory
@@ -85,8 +86,11 @@
     resulting settings and eligible assignments in Entra PIM. Policy-related
     404 responses are retried for a limited time; other errors are reported.
  
-    The GUI creates an audit log in Documents by default. Browse to choose
-    another .log file; existing files are appended after confirmation.
+    The GUI creates an audit log in Documents by default using the name
+    yyyy-MM-dd_HHmm-PIM-Group-Manager.log. A log already at that path is
+    appended automatically; sessions started in the same minute share the
+    file, and each entry includes a session ID. Browse to choose another
+    .log file; an existing file is appended only after confirmation.
     Entries can contain group details, membership rules, and user UPNs.
     Restrict access to the log and retain it according to your policies.
     Graph changes are blocked when required audit records cannot be written.
@@ -108,10 +112,6 @@
 #>
  
 # ==================================================
-# ^^^^^ Script Information ^^^^^
-# ==================================================
- 
-# ==================================================
 # MARK: Prerequisites and Script Configuration
 # ==================================================
  
@@ -126,6 +126,139 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
  
+$Script:HelpContent = @'
+PREREQUISITES
+
+- Run in Windows PowerShell 5.1 with an internet connection.
+
+- Install Microsoft.Graph.Authentication: Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
+
+- XLSX files need ImportExcel: Install-Module ImportExcel -Scope CurrentUser. CSV works without it.
+
+- PIM requires Microsoft Entra ID P2 or EMS E5 licensing.
+
+- The signed-in account needs consented Graph permissions shown in the connection dialog.
+
+- Creating role-assignable groups and changing their PIM settings generally requires Privileged Role Administrator or equivalent permissions.
+
+- Delegated Graph scopes requested: User.Read, User.Read.All, Group.ReadWrite.All, RoleManagementPolicy.ReadWrite.AzureADGroup, and PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup.
+
+CONNECTION
+
+1. Review the audit log path at the bottom of the window. Browse to select a different location and .log file name.
+
+2. Click Connect / Login and sign in interactively. Grant/obtain admin consent for the requested Graph scopes.
+
+3. Click Check connection. Group operations remain blocked unless Graph confirms the account and all required scopes.
+
+4. Use Disconnect to sign out of the Graph session.
+
+AUDIT LOG
+
+- The default is Documents\yyyy-MM-dd_HHmm-PIM-Group-Manager.log. Sessions started in the same minute share the file; each entry includes a session ID.
+
+- If the default file already exists, new entries are appended. When selecting an existing file with Browse, the GUI asks for confirmation first.
+
+- Entries include UTC time, session ID, Windows and Graph accounts, tenant, group and PIM actions, outcomes, and errors.
+
+- Entries may contain UPNs, group properties, and dynamic membership rules. Protect the file and follow retention policies.
+
+- If logging fails, required Graph changes are blocked; earlier actions may have completed. Review the log and Entra PIM.
+
+- The file is not tamper-proof. Use Entra audit logs as the authoritative service-side record.
+
+ONE GROUP
+
+1. Enter a group name, description, and mail nickname.
+
+2. Choose a group type. PIM-enabled role-assignable security is selected by default.
+
+3. For dynamic groups, choose User or Device and enter an Entra membership rule. Entra validates the rule.
+
+4. For a PIM group, review the Member policy settings. Defaults are 8-hour activation, MFA, 365-day eligible assignments, no permanent active assignments, and MFA plus justification for active assignments.
+
+5. Optionally enter user UPNs to assign as PIM-eligible members. This does not make them active members.
+
+6. Click Create group and confirm. Newly created PIM groups wait 10 seconds for Microsoft Entra propagation before PIM settings are applied. Review the outcome in the log.
+
+RETRY PIM SETTINGS ON AN EXISTING GROUP
+
+1. Select the PIM-enabled role-assignable group type and enter the existing group's exact display name or object ID. If multiple groups have that name, use the object ID.
+
+2. Review the Member settings, then select Apply PIM to existing group. Check the returned group name and ID before confirming.
+
+3. This changes policy only: it does not create a group, assign roles, or add eligible members. It can partially update settings on failure.
+
+4. Review the log and verify the settings and any prior eligible assignments in Entra PIM.
+
+BULK GROUPS
+
+1. Click Create CSV / XLSX template. XLSX creation requires ImportExcel; CSV does not.
+
+2. Fill GroupName for each row. GroupType must be PIMRoleAssignable, SecurityAssigned, SecurityDynamic, Microsoft365Assigned, or Microsoft365Dynamic.
+
+3. For dynamic groups, set MembershipType to User or Device and provide MembershipRule.
+
+4. PIM fields can be set per row. Use True/False values. EligibleMemberUPNs accepts semicolon-separated UPNs.
+
+5. Import the file. The GUI validates all rows before allowing creation. Confirm the group count before changes are submitted.
+
+6. Review the results CSV saved beside the bulk input.
+
+IMPORTANT
+
+- A role-assignable group must be a security group with assigned (not dynamic) membership. Entra does not allow dynamic membership for role-assignable groups.
+
+- Creating a role-assignable group only makes it eligible to receive Entra roles. It does not assign any role. Assign the required role to the group separately in Entra PIM.
+
+- The GUI automatically prefixes PIM group descriptions with "*DO NOT ADD TO THIS GROUP* Add from PIM Assignments portal".
+
+- EligibleMemberUPNs creates eligible membership assignments through PIM. The group policy is configured first. A failed PIM configuration can leave the group created; the log and results file report partial completion.
+
+- Dynamic rules are submitted to Entra as entered. Validate the rule and membership impact before creating the group.
+
+- PIM policy changes use Microsoft Graph role-management policy APIs and are read back after updating. Verify the resulting settings in the Entra PIM portal.
+'@
+
+function Show-HelpWindow
+{
+    if ($Script:HelpWindow -and -not $Script:HelpWindow.IsDisposed)
+    {
+        if ($Script:HelpWindow.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized)
+        {
+            $Script:HelpWindow.WindowState = [System.Windows.Forms.FormWindowState]::Normal
+        }
+        $Script:HelpWindow.Activate()
+        return
+    }
+
+    $HelpWindow = New-Object System.Windows.Forms.Form
+    $HelpWindow.Text = 'PIM Group Manager - How to use'
+    $HelpWindow.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+    $HelpWindow.Size = New-Object System.Drawing.Size(950, 760)
+    $HelpWindow.MinimumSize = New-Object System.Drawing.Size(700, 500)
+    $HelpWindow.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $HelpWindow.BackColor = [System.Drawing.Color]::White
+    $HelpWindow.ShowInTaskbar = $false
+
+    $HelpTextBox = New-Object System.Windows.Forms.TextBox
+    $HelpTextBox.Multiline = $true
+    $HelpTextBox.ReadOnly = $true
+    $HelpTextBox.WordWrap = $true
+    $HelpTextBox.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+    $HelpTextBox.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+    $HelpTextBox.Location = New-Object System.Drawing.Point(16, 16)
+    $HelpTextBox.Size = New-Object System.Drawing.Size(900, 690)
+    $HelpTextBox.Anchor = 'Top, Bottom, Left, Right'
+    $HelpTextBox.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $HelpTextBox.BackColor = [System.Drawing.Color]::White
+    $HelpTextBox.Text = $Script:HelpContent
+    $HelpWindow.Controls.Add($HelpTextBox)
+    $HelpWindow.Add_FormClosed({ $Script:HelpWindow = $null })
+    $Script:HelpWindow = $HelpWindow
+    $HelpWindow.Show($Script:MainForm) | Out-Null
+}
+
 $Script:GraphScopes = @(
     'User.Read'
     'User.Read.All'
@@ -137,6 +270,7 @@ $Script:BulkRows = @()
 $Script:BulkPath = ''
 $Script:ConnectionStatusLabel = $null
 $Script:MainForm = $null
+$Script:HelpWindow = $null
 $Script:GroupTypeBox = $null
 $Script:PreviousGroupTypeIndex = 0
 $Script:MembershipTypeBox = $null
@@ -174,7 +308,7 @@ $Script:AuditTenant = 'Unknown'
 $Script:AuditFailure = $null
 $AuditDirectory = [Environment]::GetFolderPath('MyDocuments')
 $Script:AuditPath = if ([string]::IsNullOrWhiteSpace($AuditDirectory)) { '' } else {
-    Join-Path $AuditDirectory ("PIM-Group-Manager-{0}-{1}.log" -f (Get-Date -Format 'yyyy-MM-dd_HHmmss'), $Script:AuditSessionId.Substring(0, 8))
+    Join-Path $AuditDirectory ("{0}-PIM-Group-Manager.log" -f (Get-Date -Format 'yyyy-MM-dd_HHmm'))
 }
 $Script:TabControl = $null
 $Script:TemplateColumns = @(
@@ -1060,21 +1194,46 @@ function Set-PimMemberSettings
  
 function Get-ExistingPimGroup
 {
-    param([Parameter(Mandatory = $true)][System.String]$GroupId)
+    param([Parameter(Mandatory = $true)][System.String]$GroupNameOrId)
  
-    $ParsedId = [guid]::Empty
-    if (-not [guid]::TryParse($GroupId.Trim(), [ref]$ParsedId))
+    $SearchTerm = $GroupNameOrId.Trim()
+    if ([System.String]::IsNullOrWhiteSpace($SearchTerm))
     {
-        throw 'Enter a valid existing group object ID (GUID).'
+        throw 'Enter an existing group display name or object ID.'
     }
-    $Uri = 'https://graph.microsoft.com/v1.0/groups/' + $ParsedId.ToString() + '?$select=id,displayName,securityEnabled,mailEnabled,isAssignableToRole,groupTypes,onPremisesSyncEnabled'
-    $Group = Invoke-PimGraphRequest -Method GET -Uri $Uri
-    if ($Group.id -ne $ParsedId.ToString() -or [string]::IsNullOrWhiteSpace($Group.displayName) -or
+
+    $ParsedId = [guid]::Empty
+    $IsObjectId = [guid]::TryParse($SearchTerm, [ref]$ParsedId)
+    if ($IsObjectId)
+    {
+        $Uri = 'https://graph.microsoft.com/v1.0/groups/' + $ParsedId.ToString() + '?$select=id,displayName,securityEnabled,mailEnabled,isAssignableToRole,groupTypes,onPremisesSyncEnabled'
+        $Group = Invoke-PimGraphRequest -Method GET -Uri $Uri
+    }
+    else
+    {
+        $EscapedDisplayName = $SearchTerm.Replace("'", "''")
+        $Filter = "displayName eq '$EscapedDisplayName'"
+        $Uri = 'https://graph.microsoft.com/v1.0/groups?$filter=' + [uri]::EscapeDataString($Filter) + '&$select=id,displayName,securityEnabled,mailEnabled,isAssignableToRole,groupTypes,onPremisesSyncEnabled&$top=2'
+        $Response = Invoke-PimGraphRequest -Method GET -Uri $Uri
+        $GroupMatches = @($Response.value)
+        if ($GroupMatches.Count -eq 0)
+        {
+            throw "No group with the exact display name '$SearchTerm' was found. No settings were changed."
+        }
+        if ($GroupMatches.Count -gt 1)
+        {
+            throw "Multiple groups have the display name '$SearchTerm'. Enter the group's object ID instead. No settings were changed."
+        }
+        $Group = $GroupMatches[0]
+    }
+
+    if (($IsObjectId -and $Group.id -ne $ParsedId.ToString()) -or
+        [string]::IsNullOrWhiteSpace($Group.id) -or [string]::IsNullOrWhiteSpace($Group.displayName) -or
         $Group.securityEnabled -ne $true -or $Group.mailEnabled -ne $false -or
         $Group.isAssignableToRole -ne $true -or $Group.onPremisesSyncEnabled -eq $true -or
         @($Group.groupTypes) -contains 'DynamicMembership')
     {
-        throw "Group $ParsedId is not a verified cloud-only, role-assignable security group with assigned membership. No settings were changed."
+        throw "Group '$($Group.displayName)' [$($Group.id)] is not a verified cloud-only, role-assignable security group with assigned membership. No settings were changed."
     }
     return $Group
 }
@@ -1794,6 +1953,12 @@ $HeaderTitle.Font = New-Object System.Drawing.Font('Segoe UI', 14, [System.Drawi
 $HeaderTitle.ForeColor = [System.Drawing.Color]::White
 $HeaderSubtitle = Add-UiLabel -Parent $HeaderPanel -Text 'Microsoft Entra groups and privileged access' -X 20 -Y 34 -Width 500 -Height 18
 $HeaderSubtitle.ForeColor = [System.Drawing.Color]::FromArgb(194, 208, 228)
+$HelpButton = New-Object System.Windows.Forms.Button
+$HelpButton.Text = 'How to use'
+$HelpButton.Location = New-Object System.Drawing.Point(860, 15)
+$HelpButton.Size = New-Object System.Drawing.Size(145, 30)
+$HelpButton.Anchor = 'Top, Right'
+$HeaderPanel.Controls.Add($HelpButton)
  
 $ConnectionGroup = New-Object System.Windows.Forms.GroupBox
 $ConnectionGroup.Text = 'Microsoft Graph connection'
@@ -1874,6 +2039,7 @@ $Script:MailNicknameBox.Add_TextChanged({
 $Script:GroupTypeBox = New-Object System.Windows.Forms.ComboBox
 $Script:GroupTypeBox.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
 $Script:GroupTypeBox.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$Script:GroupTypeBox.BackColor = [System.Drawing.Color]::FromArgb(231, 237, 246)
 $Script:GroupTypeBox.Items.AddRange(@(
     'PIM-enabled security (role-assignable)'
     'Security group (assigned membership)'
@@ -1902,14 +2068,14 @@ $Script:MembershipRuleLabel.Visible = $false
 $Script:MembershipTypeBox.Visible = $false
 $Script:MembershipTypeLabel.Visible = $false
  
-$Script:ExistingGroupIdLabel = Add-UiLabel -Parent $CreateTab -Text 'Existing group ID (policy only)' -X 18 -Y 178
+$Script:ExistingGroupIdLabel = Add-UiLabel -Parent $CreateTab -Text 'Existing group name or ID' -X 18 -Y 178
 $Script:ExistingGroupIdBox = Add-UiTextBox -Parent $CreateTab -X 215 -Y 178 -Width 400
 $Script:ApplyExistingButton = New-Object System.Windows.Forms.Button
 $Script:ApplyExistingButton.Text = 'Apply PIM to existing group'
 $Script:ApplyExistingButton.Location = New-Object System.Drawing.Point(630, 175)
 $Script:ApplyExistingButton.Size = New-Object System.Drawing.Size(220, 30)
 $CreateTab.Controls.Add($Script:ApplyExistingButton)
-$Script:ExistingGroupHint = Add-UiLabel -Parent $CreateTab -Text 'For existing groups, only the PIM settings below are changed; no eligible members are added.' -X 215 -Y 212 -Width 700 -Height 38
+$Script:ExistingGroupHint = Add-UiLabel -Parent $CreateTab -Text 'Enter the exact display name or object ID. If multiple groups match, use the object ID. Only PIM settings are changed; no eligible members are added.' -X 215 -Y 212 -Width 700 -Height 38
  
 $Script:PimGroupBox = New-Object System.Windows.Forms.GroupBox
 $Script:PimGroupBox.Text = 'PIM Member settings'
@@ -1999,83 +2165,6 @@ $BulkTab.Controls.Add($Script:BulkCreateButton)
 # ==================================================
  
 # ==================================================
-# MARK: How to Use Tab
-# ==================================================
- 
-$HelpTab = New-Object System.Windows.Forms.TabPage
-$HelpTab.Text = 'How to use'
-$HelpTab.BackColor = [System.Drawing.Color]::White
-$Script:TabControl.TabPages.Add($HelpTab)
-$HelpText = New-Object System.Windows.Forms.TextBox
-$HelpText.Multiline = $true
-$HelpText.ReadOnly = $true
-$HelpText.WordWrap = $true
-$HelpText.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
-$HelpText.Location = New-Object System.Drawing.Point(18, 16)
-$HelpText.Size = New-Object System.Drawing.Size(930, 560)
-$HelpText.Anchor = 'Top, Bottom, Left, Right'
-$HelpText.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
-$HelpText.BackColor = [System.Drawing.Color]::White
-$HelpText.Text = @'
-PREREQUISITES
-- Run in Windows PowerShell 5.1 with an internet connection.
-- Install Microsoft.Graph.Authentication: Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
-- XLSX files need ImportExcel: Install-Module ImportExcel -Scope CurrentUser. CSV works without it.
-- PIM requires Microsoft Entra ID P2 or EMS E5 licensing.
-- The signed-in account needs consented Graph permissions shown in the connection dialog.
-- Creating role-assignable groups and changing their PIM settings generally requires Privileged Role Administrator or equivalent permissions.
-- Delegated Graph scopes requested: User.Read, User.Read.All, Group.ReadWrite.All, RoleManagementPolicy.ReadWrite.AzureADGroup, and PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup.
- 
-CONNECTION
-1. Review the audit log path at the bottom of the window. Browse to select a different location and .log file name.
-2. Click Connect / Login and sign in interactively. Grant/obtain admin consent for the requested Graph scopes.
-3. Click Check connection. Group operations remain blocked unless Graph confirms the account and all required scopes.
-4. Use Disconnect to sign out of the Graph session.
- 
-AUDIT LOG
-- The default is a unique log file in Documents. Existing log files are appended only after confirmation.
-- Entries include UTC time, session ID, Windows and Graph accounts, tenant, group and PIM actions, outcomes, and errors.
-- Entries may contain UPNs, group properties, and dynamic membership rules. Protect the file and follow retention policies.
-- If logging fails, required Graph changes are blocked; earlier actions may have completed. Review the log and Entra PIM.
-- The file is not tamper-proof. Use Entra audit logs as the authoritative service-side record.
- 
-ONE GROUP
-1. Enter a group name, description, and mail nickname.
-2. Choose a group type. PIM-enabled role-assignable security is selected by default.
-3. For dynamic groups, choose User or Device and enter an Entra membership rule. Entra validates the rule.
-4. For a PIM group, review the Member policy settings. Defaults are 8-hour activation, MFA, 365-day eligible assignments, no permanent active assignments, and MFA plus justification for active assignments.
-5. Optionally enter user UPNs to assign as PIM-eligible members. This does not make them active members.
-6. Click Create group and confirm. Newly created PIM groups wait 10 seconds for Microsoft Entra propagation before PIM settings are applied. Review the outcome in the log.
- 
-RETRY PIM SETTINGS ON AN EXISTING GROUP
-1. Select the PIM-enabled role-assignable group type and enter the existing group object ID.
-2. Review the Member settings, then select Apply PIM to existing group. Check the returned group name and ID before confirming.
-3. This changes policy only: it does not create a group, assign roles, or add eligible members. It can partially update settings on failure.
-4. Review the log and verify the settings and any prior eligible assignments in Entra PIM.
- 
-BULK GROUPS
-1. Click Create CSV / XLSX template. XLSX creation requires ImportExcel; CSV does not.
-2. Fill GroupName for each row. GroupType must be PIMRoleAssignable, SecurityAssigned, SecurityDynamic, Microsoft365Assigned, or Microsoft365Dynamic.
-3. For dynamic groups, set MembershipType to User or Device and provide MembershipRule.
-4. PIM fields can be set per row. Use True/False values. EligibleMemberUPNs accepts semicolon-separated UPNs.
-5. Import the file. The GUI validates all rows before allowing creation. Confirm the group count before changes are submitted.
-6. Review the results CSV saved beside the bulk input.
- 
-IMPORTANT
-- A role-assignable group must be a security group with assigned (not dynamic) membership. Entra does not allow dynamic membership for role-assignable groups.
-- Creating a role-assignable group only makes it eligible to receive Entra roles. It does not assign any role. Assign the required role to the group separately in Entra PIM.
-- The GUI automatically prefixes PIM group descriptions with "*DO NOT ADD TO THIS GROUP* Add from PIM Assignments portal".
-- EligibleMemberUPNs creates eligible membership assignments through PIM. The group policy is configured first. A failed PIM configuration can leave the group created; the log and results file report partial completion.
-- Dynamic rules are submitted to Entra as entered. Validate the rule and membership impact before creating the group.
-- PIM policy changes use Microsoft Graph role-management policy APIs and are read back after updating. Verify the resulting settings in the Entra PIM portal.
-'@
-$HelpTab.Controls.Add($HelpText)
- 
-# ==================================================
-# ^^^^^ How to Use Tab ^^^^^
-# ==================================================
- 
-# ==================================================
 # MARK: Activity Log
 # ==================================================
  
@@ -2103,7 +2192,7 @@ $Script:LogBox.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
 $Script:LogBox.BackColor = [System.Drawing.Color]::White
 $Script:MainForm.Controls.Add($Script:LogBox)
  
-foreach ($Button in @($CheckConnectionButton, $DisconnectButton, $Script:ApplyExistingButton, $TemplateButton, $ImportBulkButton, $Script:AuditBrowseButton))
+foreach ($Button in @($CheckConnectionButton, $DisconnectButton, $Script:ApplyExistingButton, $TemplateButton, $ImportBulkButton, $Script:AuditBrowseButton, $HelpButton))
 {
     Set-UiButtonStyle -Button $Button
 }
@@ -2121,6 +2210,17 @@ foreach ($Button in @($ConnectButton, $CreateButton, $Script:BulkCreateButton))
 # ==================================================
  
 $Script:GroupTypeBox.Add_SelectedIndexChanged({ Handle-GroupTypeChanged })
+$HelpButton.Add_Click({
+    try
+    {
+        Show-HelpWindow
+    }
+    catch
+    {
+        Write-UiLog "Could not open the help window: $($_.Exception.Message)"
+        Show-Message -Message $_.Exception.Message -Title 'Help window failed to open' -Icon Error
+    }
+})
 $Script:AuditBrowseButton.Add_Click({
     $Dialog = New-Object System.Windows.Forms.SaveFileDialog
     try
@@ -2295,7 +2395,7 @@ $Script:ApplyExistingButton.Add_Click({
         {
             throw 'Select the PIM-enabled role-assignable group type.'
         }
-        $Group = Get-ExistingPimGroup -GroupId $Script:ExistingGroupIdBox.Text
+        $Group = Get-ExistingPimGroup -GroupNameOrId $Script:ExistingGroupIdBox.Text
         $Summary = "Apply the selected PIM Member settings to:`r`n$($Group.displayName)`r`nGroup ID: $($Group.id)`r`n`r`nThis changes the existing policy, can partially complete if an error occurs, and does not create a group, assign roles, or add eligible members. Continue?"
         if ([System.Windows.Forms.MessageBox]::Show(
             $Script:MainForm, $Summary, 'Confirm existing group PIM changes',
