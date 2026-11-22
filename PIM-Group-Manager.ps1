@@ -137,7 +137,7 @@ PREREQUISITES
 
 - PIM requires Microsoft Entra ID P2 or EMS E5 licensing.
 
-- The signed-in account needs consented Graph permissions shown in the connection dialog.
+- The signed-in account needs consent for the Graph permissions listed below.
 
 - Creating role-assignable groups and changing their PIM settings generally requires Privileged Role Administrator or equivalent permissions.
 
@@ -155,7 +155,7 @@ CONNECTION
 
 AUDIT LOG
 
-- The default is Documents\yyyy-MM-dd_HHmm-PIM-Group-Manager.log. Sessions started in the same minute share the file; each entry includes a session ID.
+- By default, the log is stored in the current user's Documents folder as yyyy-MM-dd_HHmm-PIM-Group-Manager.log. The path is chosen when the app starts; sessions launched during the same minute append to the same file, and each entry includes a session ID.
 
 - If the default file already exists, new entries are appended. When selecting an existing file with Browse, the GUI asks for confirmation first.
 
@@ -169,11 +169,11 @@ AUDIT LOG
 
 ONE GROUP
 
-1. Enter a group name, description, and mail nickname.
+1. Enter a group name. The description and mail nickname are optional; if the mail nickname is blank, the app generates one from the group name.
 
 2. Choose a group type. PIM-enabled role-assignable security is selected by default.
 
-3. For dynamic groups, choose User or Device and enter an Entra membership rule. Entra validates the rule.
+3. For dynamic groups, enter an Entra membership rule. Dynamic security groups can target Users or Devices; Microsoft 365 dynamic groups support Users only. Entra validates the rule.
 
 4. For a PIM group, review the Member policy settings. Defaults are 8-hour activation, MFA, 365-day eligible assignments, no permanent active assignments, and MFA plus justification for active assignments.
 
@@ -183,7 +183,7 @@ ONE GROUP
 
 RETRY PIM SETTINGS ON AN EXISTING GROUP
 
-1. Select the PIM-enabled role-assignable group type and enter the existing group's exact display name or object ID. If multiple groups have that name, use the object ID.
+1. Select the PIM-enabled role-assignable group type and enter the existing group's exact display name or object ID. The group must be cloud-only, role-assignable security with assigned membership. If multiple groups have that name, use the object ID.
 
 2. Review the Member settings, then select Apply PIM to existing group. Check the returned group name and ID before confirming.
 
@@ -197,7 +197,7 @@ BULK GROUPS
 
 2. Fill GroupName for each row. GroupType must be PIMRoleAssignable, SecurityAssigned, SecurityDynamic, Microsoft365Assigned, or Microsoft365Dynamic.
 
-3. For dynamic groups, set MembershipType to User or Device and provide MembershipRule.
+3. For dynamic groups, set MembershipType and provide MembershipRule. Security dynamic groups can use User or Device; Microsoft 365 dynamic groups support User only.
 
 4. PIM fields can be set per row. Use True/False values. EligibleMemberUPNs accepts semicolon-separated UPNs.
 
