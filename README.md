@@ -85,6 +85,8 @@ The `-STA` option is required for the graphical interface.
  
 Select **How to use** in the main window header to open the instructions in a separate window. The help window closes with the main application.
 
+The guide groups instructions by task and adds spacing between steps and bullet points to make them easier to scan.
+
 ---
  
 ## Connect to Microsoft Entra
