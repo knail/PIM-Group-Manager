@@ -27,13 +27,13 @@ Larger, bold tabs highlight the selected tab in blue. Assignment results resize 
 
 Configure group properties, PIM policy settings, and optional eligible members.
 
-![Create one group tab with Eligible Assignments and Active Assignments settings](screenshots/create-one-group.png?v=4fc64f1)
+![Create one group tab with Eligible Assignments and Active Assignments settings](screenshots/create-one-group.png?v=9433ee6df16a)
 
 ### Assignments
 
 Query a group, add or remove members, scan all groups, and export report results.
 
-![Assignments tab with single-group actions, all-group reports, and export results](screenshots/assignments.png?v=4fc64f1)
+![Assignments tab with single-group actions, all-group reports, and export results](screenshots/assignments.png?v=078942d38a9d)
  
 ---
  
