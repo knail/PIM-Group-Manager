@@ -33,7 +33,7 @@ Configure group properties, PIM policy settings, and optional eligible members.
 
 Query a group, add or remove members, scan all groups, and export report results.
 
-![Assignments tab with single-group actions, all-group reports, and export results](screenshots/assignments.png)
+![Assignments tab with single-group actions, all-group reports, and export results](screenshots/assignments.png?v=4fc64f1)
  
 ---
  
