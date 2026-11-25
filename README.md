@@ -134,7 +134,7 @@ Connect to Microsoft Graph and open **Assignments**:
 1. Under **One group**, enter an exact group display name or object ID and select **Query one group** to see current eligible member and owner assignments. The group must be a cloud-only, role-assignable security group with assigned membership. Use the object ID if names are duplicated.
 2. Under **All groups (read-only)**, select **Query all eligible** to find current eligible assignments across role-assignable groups.
 3. Select **Scan permanent active** to find permanent PIM active member assignments and review direct members.
-4. Review the table and select **Export results** to save findings. Excel (`.xlsx`) is the default when ImportExcel is installed; otherwise CSV is the default. Choose either format in the save dialog. Excel reports and bulk templates use table style **Light20**. The suggested filename begins with `YYYY-MM-DD_HHmm-`. Values that could be interpreted as spreadsheet formulas are prefixed with an apostrophe in both formats.
+4. Review the table and select **Export results** to save findings. Excel (`.xlsx`) is the default when ImportExcel is installed; otherwise CSV is the default. Choose either format in the save dialog. Excel reports and bulk templates use table style **Light20**. Suggested filenames include the completed report type after `YYYY-MM-DD_HHmm-`: `all-eligible`, `all-permanent`, or `one-group-eligible`, followed by `-PIM-Assignment-Report`. Values that could be interpreted as spreadsheet formulas are prefixed with an apostrophe in both formats.
 
 The all-groups eligible report omits PrincipalId and PrincipalType from both the table and export. Names or UPNs may be blank when Graph does not return them; query the group individually to see the principal ID.
 

@@ -334,6 +334,7 @@ $Script:ReportScope = 'PrivilegedAssignmentSchedule.Read.AzureADGroup'
 $Script:AssignmentWriteScope = 'PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup'
 $Script:RoleManagementWriteScope = 'RoleManagement.ReadWrite.Directory'
 $Script:ReportRows = @()
+$Script:ReportMode = $null
 $Script:BulkRows = @()
 $Script:BulkPath = ''
 $Script:ConnectionStatusLabel = $null
@@ -1605,6 +1606,7 @@ function Invoke-AssignmentReport
 {
     param([ValidateSet('OneEligible', 'AllEligible', 'Permanent')][string]$Mode)
     $Script:ReportRows = @()
+    $Script:ReportMode = $null
     $Script:ReportGrid.Rows.Clear()
     $Script:ReportGrid.Columns['PrincipalId'].Visible = $Mode -ne 'AllEligible'
     $Script:ReportGrid.Columns['PrincipalType'].Visible = $Mode -ne 'AllEligible'
@@ -1665,12 +1667,14 @@ function Invoke-AssignmentReport
             [void]$Script:ReportGrid.Rows.Add(@($Row.GroupName, $Row.GroupId, $Row.Finding, $Row.Access, $Row.PrincipalName, $Row.UserPrincipalName, $Row.PrincipalId, $Row.PrincipalType, $Row.StartUtc, $Row.EndUtc))
         }
         $Script:ReportStatus.Text = "Completed: $($Groups.Count) group(s), $($Rows.Count) finding(s)."
+        $Script:ReportMode = $Mode
         $Script:ReportExportButton.Enabled = $Rows.Count -gt 0
         Write-UiLog "Assignment report ${Mode} completed: $($Groups.Count) group(s), $($Rows.Count) finding(s)."
     }
     catch
     {
         $Script:ReportRows = @()
+        $Script:ReportMode = $null
         $Script:ReportGrid.Rows.Clear()
         $Script:ReportStatus.Text = 'Scan failed; no results displayed.'
         Write-UiLog "Assignment report ${Mode} failed: $($_.Exception.Message)"
@@ -1740,7 +1744,14 @@ function Export-AssignmentReport
         $Dialog.DefaultExt = if ($ExcelAvailable) { 'xlsx' } else { 'csv' }
         $Dialog.AddExtension = $true
         $Dialog.OverwritePrompt = $true
-        $Dialog.FileName = "$(Get-Date -Format 'yyyy-MM-dd_HHmm')-PIM-Assignment-Report"
+        $ReportName = switch ($Script:ReportMode)
+        {
+            'OneEligible' { 'one-group-eligible' }
+            'AllEligible' { 'all-eligible' }
+            'Permanent' { 'all-permanent' }
+            default { throw 'The report type is unavailable. Run the report again before exporting.' }
+        }
+        $Dialog.FileName = "$(Get-Date -Format 'yyyy-MM-dd_HHmm')-$ReportName-PIM-Assignment-Report"
         if ($Dialog.ShowDialog($Script:MainForm) -ne [System.Windows.Forms.DialogResult]::OK) { return }
         Write-AssignmentReportFile -Path $Dialog.FileName -Rows @($Script:ReportRows)
         Write-UiLog "Assignment report exported to '$($Dialog.FileName)' ($($Script:ReportRows.Count) findings)."
@@ -1857,6 +1868,7 @@ function Show-AddEligibleMembers
 
             $Script:ReportGroupBox.Text = $Group.id
             $Script:ReportRows = @()
+            $Script:ReportMode = $null
             $Script:ReportGrid.Rows.Clear()
             $Script:ReportExportButton.Enabled = $false
             $Script:ReportStatus.Text = 'Assignments may have changed; run a new report.'
@@ -2205,6 +2217,7 @@ function Show-RemoveMembers
             finally { $Review.Dispose() }
             $Script:ReportGroupBox.Text = $Group.id
             $Script:ReportRows = @()
+            $Script:ReportMode = $null
             $Script:ReportGrid.Rows.Clear()
             $Script:ReportExportButton.Enabled = $false
             $Script:ReportStatus.Text = 'Assignments may have changed; run a new report.'
@@ -3346,6 +3359,7 @@ $ConnectButton.Add_Click({
     try
     {
         $Script:ReportRows = @()
+        $Script:ReportMode = $null
         $Script:ReportGrid.Rows.Clear()
         $Script:ReportExportButton.Enabled = $false
         $Script:ReportStatus.Text = 'No report run.'
@@ -3394,6 +3408,7 @@ $DisconnectButton.Add_Click({
         $Script:ConnectionStatusLabel.Text = 'Not connected'
         $Script:ConnectionStatusLabel.ForeColor = [System.Drawing.Color]::Black
         $Script:ReportRows = @()
+        $Script:ReportMode = $null
         $Script:ReportGrid.Rows.Clear()
         $Script:ReportExportButton.Enabled = $false
         $Script:ReportStatus.Text = 'No report run.'

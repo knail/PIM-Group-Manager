@@ -287,4 +287,59 @@ finally
     if (Test-Path -LiteralPath $ExcelPath) { Remove-Item -LiteralPath $ExcelPath }
     Remove-Item -LiteralPath $TestDirectory
 }
+foreach ($Name in @('Invoke-AssignmentReport', 'Export-AssignmentReport'))
+{
+    $Function = $Ast.Find({ param($Node) $Node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $Node.Name -eq $Name }, $true)
+    $Definition = $Function.Extent.Text.Replace('$Dialog.ShowDialog($Script:MainForm)', '(Test-ReportExportDialog -Dialog $Dialog)')
+    . ([scriptblock]::Create($Definition))
+}
+function Test-ReportExportDialog($Dialog)
+{
+    Assert-True ($Dialog.FileName -match ('^\d{4}-\d{2}-\d{2}_\d{4}-' + $Script:ExpectedReportSuffix + '-PIM-Assignment-Report$')) 'Export filename must identify the completed report after its timestamp.'
+    return [System.Windows.Forms.DialogResult]::Cancel
+}
+function Assert-GraphReady { if ($Script:FailReport) { throw 'Simulated report failure.' } }
+function Get-GraphContext { return @{ Scopes = @($Script:ReportScope) } }
+function Get-ReportGroups { return @{ id = 'test-group'; displayName = 'Test group' } }
+function Get-ExistingPimGroup { param($GroupNameOrId) Get-ReportGroups }
+function Get-EligibleReportRows { param($Group, $Now) return $Script:TestReportRow }
+function Get-PermanentReportRows { param($Group, $Now) return $Script:TestReportRow }
+function Show-Message { param($Message, $Title, $Icon) $Script:ReportError = $Message }
+$Script:TestReportRow = [pscustomobject]@{ GroupName = 'Test group'; GroupId = 'test-group'; Finding = 'Example'; Access = 'member'; PrincipalName = 'Example user'; UserPrincipalName = 'example@example.invalid'; PrincipalId = 'test-user'; PrincipalType = 'User'; StartUtc = ''; EndUtc = '' }
+$Script:ReportGrid = New-Object System.Windows.Forms.DataGridView
+$Script:ReportGrid.AllowUserToAddRows = $false
+foreach ($Column in $Script:TestReportRow.PSObject.Properties.Name) { [void]$Script:ReportGrid.Columns.Add($Column, $Column) }
+$Script:MainForm = [pscustomobject]@{ UseWaitCursor = $false }
+$Script:TabControl = [pscustomobject]@{ Enabled = $true }
+$Script:AuditBrowseButton = [pscustomobject]@{ Enabled = $true }
+$Script:ReportExportButton = [pscustomobject]@{ Enabled = $false }
+$Script:ReportGroupBox = [pscustomobject]@{ Text = 'Test group' }
+$Script:ReportStatus = [pscustomobject]@{ Text = '' }
+$Script:ReportStatus | Add-Member ScriptMethod Refresh {}
+$Script:FailReport = $false
+try
+{
+    foreach ($Case in @(
+        @{ Mode = 'AllEligible'; Suffix = 'all-eligible' },
+        @{ Mode = 'Permanent'; Suffix = 'all-permanent' },
+        @{ Mode = 'OneEligible'; Suffix = 'one-group-eligible' }))
+    {
+        Invoke-AssignmentReport -Mode $Case.Mode
+        Assert-True (@($Script:ReportRows).Count -eq 1 -and $Script:ReportMode -eq $Case.Mode) "Completed report must retain its type with its results. $Script:ReportError"
+        $Script:ExpectedReportSuffix = $Case.Suffix
+        Export-AssignmentReport
+    }
+    $Script:FailReport = $true
+    Invoke-AssignmentReport -Mode 'AllEligible'
+    Assert-True ($Script:ReportMode -eq $null -and $Script:ReportRows.Count -eq 0 -and
+        $Script:ReportError -match 'Simulated report failure') 'Failed reports must discard both their results and filename metadata.'
+    $Script:ReportRows = @($Script:TestReportRow)
+    try { Export-AssignmentReport; throw 'Missing report type was accepted.' }
+    catch { if ($_.Exception.Message -notmatch 'report type is unavailable') { throw } }
+}
+finally
+{
+    $Script:ReportGrid.Dispose()
+    $Script:MainForm = $null
+}
 Write-Output 'Assignment report tests passed.'
