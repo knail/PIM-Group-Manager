@@ -19,7 +19,8 @@
     For role-assignable security groups, the script configures PIM Member
     settings and can optionally create eligible member assignments by UPN.
     The GUI can also apply the selected PIM Member settings to an existing
-    role-assignable security group without creating another group.
+    role-assignable security group, and submit eligible member requests for
+    existing PIM-supported security and Microsoft 365 groups.
  
     Bulk templates support group properties, PIM settings, and optional eligible
     member UPNs per row. Bulk input is validated before group creation.
@@ -45,7 +46,10 @@
     - Delegated consent for User.Read, User.Read.All, Group.ReadWrite.All,
       RoleManagementPolicy.ReadWrite.AzureADGroup, and
       PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup. The reports also
-      request PrivilegedAssignmentSchedule.Read.AzureADGroup.
+      request PrivilegedAssignmentSchedule.Read.AzureADGroup. Active PIM
+      removal additionally requests PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup;
+      direct removal from role-assignable groups also requires
+      RoleManagement.ReadWrite.Directory.
  
     Install modules in the PowerShell environment used to launch the GUI:
         Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
@@ -116,7 +120,42 @@
 # MARK: Prerequisites and Script Configuration
 # ==================================================
  
+& {
+# Keep the guard local to this invocation so F8 cannot overwrite a running instance.
+$InstanceCreated = $false
+$InstanceName = 'Local\PIM-Group-Manager-' + [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$InstanceGuard = [System.Threading.Mutex]::new($false, $InstanceName, [ref]$InstanceCreated)
+if (-not $InstanceCreated)
+{
+    try
+    {
+        Write-Warning 'PIM Group Manager is already running in this Windows session. Use the existing window from the taskbar; this launch was skipped.'
+        if (('System.Windows.Forms.Application' -as [type]) -and $Script:MainForm -and -not $Script:MainForm.IsDisposed)
+        {
+            if ($Script:MainForm.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized)
+            {
+                $Script:MainForm.WindowState = [System.Windows.Forms.FormWindowState]::Normal
+            }
+            [void]$Script:MainForm.Activate()
+        }
+    }
+    catch
+    {
+        Write-Warning "Could not bring the existing window forward: $($_.Exception.Message)"
+    }
+    finally
+    {
+        $InstanceGuard.Dispose()
+    }
+    return
+}
+
+# The named handle's lifetime is the lock; mutex ownership would allow same-thread reentry.
+try
+{
 $ErrorActionPreference = 'Stop'
+$Script:MainForm = $null
+$Script:HelpWindow = $null
  
 if ([System.Threading.Thread]::CurrentThread.ApartmentState -ne 'STA')
 {
@@ -178,7 +217,7 @@ ONE GROUP
 
 4. For a PIM group, review the Member policy settings. Defaults are 8-hour activation, MFA, 365-day eligible assignments, no permanent active assignments, and MFA plus justification for active assignments.
 
-5. Optionally enter user UPNs to assign as PIM-eligible members. This does not make them active members.
+5. Optionally enter user UPNs separated by commas, semicolons, or new lines to assign as PIM-eligible members. This does not make them active members.
 
 6. Click Create group and confirm. Newly created PIM groups wait 10 seconds for Microsoft Entra propagation before PIM settings are applied. Review the outcome in the log.
 
@@ -206,17 +245,27 @@ BULK GROUPS
 
 6. Review the results CSV saved beside the bulk input.
 
-ASSIGNMENT REPORTS
+ASSIGNMENTS
 
-1. Connect to Graph, then open Assignment reports. For one group, enter its exact display name or object ID and select Query one group.
+1. Connect to Graph, then open Assignments. In One group, enter its exact display name or object ID and select Query one group.
 
-2. Select Query all eligible to scan all role-assignable groups for current eligible members and owners. Select Scan permanent active to inspect active member assignments and direct members.
+2. In All groups (read-only), select Query all eligible to scan all role-assignable groups for current eligible members and owners. Select Scan permanent active to inspect active member assignments and direct members.
 
 3. Review the results and optionally export them to Excel or CSV. Excel is the default when ImportExcel is installed. Results contain directory information; protect the exported file.
 
 - If the permanent scan needs additional permission, choose whether to reconnect and request consent. An administrator may need to grant it.
 
 - The all-groups eligible report omits principal ID and type. Query a group individually to see them.
+
+- Enter the group name or ID in One group before selecting Add eligible members or Remove members. The popup shows that group as bold, non-editable text; close it to change groups in the main window. Query one group is read-only. Removal requires selecting categories and reviewing the resolved users and group before confirming.
+
+- Removal can request additional consent: PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup for PIM active schedules, and RoleManagement.ReadWrite.Directory for direct membership of role-assignable groups.
+
+- PIM active membership also appears in the group's direct members. Removing either can affect active access; removing eligibility may not end an activation. Owners and nested access are not removed. Check Entra after each request, especially after an error.
+
+- Select Add eligible members to submit eligible member requests for an existing cloud-only, assigned-membership security or Microsoft 365 group. Enter the exact group name or ID in the main window, then enter one or more user UPNs in the popup separated by commas, semicolons, or new lines.
+
+- Start defaults to now and end to one year later. Choose local start/end times or permanent eligibility if the group policy allows it. Review the group, users and schedule before confirming. The action may onboard a group to PIM.
 
 - Role-assignable groups are included even if not onboarded to PIM. Other groups are not included. Direct members are candidates, not proof of permanence; verify in Entra. A member with a temporary PIM assignment may also have separate direct access.
 
@@ -282,6 +331,8 @@ $Script:GraphScopes = @(
     'PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup'
 )
 $Script:ReportScope = 'PrivilegedAssignmentSchedule.Read.AzureADGroup'
+$Script:AssignmentWriteScope = 'PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup'
+$Script:RoleManagementWriteScope = 'RoleManagement.ReadWrite.Directory'
 $Script:ReportRows = @()
 $Script:BulkRows = @()
 $Script:BulkPath = ''
@@ -586,6 +637,25 @@ function Get-SafeMailNickname
     return $Nickname
 }
  
+function ConvertTo-EligibleMemberUPNs
+{
+    param([AllowEmptyString()][string]$Text)
+
+    $Seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $EligibleMemberUPNs = [System.Collections.Generic.List[string]]::new()
+    foreach ($Entry in ($Text -split '[;,\r\n]+'))
+    {
+        $Upn = $Entry.Trim()
+        if ([string]::IsNullOrWhiteSpace($Upn)) { continue }
+        if ($Upn -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$')
+        {
+            throw "EligibleMemberUPNs contains an invalid UPN: $Upn"
+        }
+        if ($Seen.Add($Upn)) { $EligibleMemberUPNs.Add($Upn) }
+    }
+    return $EligibleMemberUPNs.ToArray()
+}
+
 function ConvertTo-GroupConfiguration
 {
     param([Parameter(Mandatory = $true)][System.Object]$Row)
@@ -648,19 +718,7 @@ function ConvertTo-GroupConfiguration
     }
  
     $EligibleMemberText = [System.String](Get-RowValue -Row $Row -Name 'EligibleMemberUPNs')
-    $EligibleMemberUPNs = @(
-        $EligibleMemberText -split '[;,\r\n]+' |
-            ForEach-Object { $_.Trim() } |
-            Where-Object { -not [System.String]::IsNullOrWhiteSpace($_) } |
-            Select-Object -Unique
-    )
-    foreach ($Upn in $EligibleMemberUPNs)
-    {
-        if ($Upn -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$')
-        {
-            throw "EligibleMemberUPNs contains an invalid UPN: $Upn"
-        }
-    }
+    $EligibleMemberUPNs = @(ConvertTo-EligibleMemberUPNs -Text $EligibleMemberText)
  
     if ($EligibleMemberUPNs.Count -gt 0 -and $GroupType -ne 'PIMRoleAssignable')
     {
@@ -1212,7 +1270,7 @@ function Set-PimMemberSettings
  
 function Get-ExistingPimGroup
 {
-    param([Parameter(Mandatory = $true)][System.String]$GroupNameOrId)
+    param([Parameter(Mandatory = $true)][System.String]$GroupNameOrId, [switch]$AllowNonRoleAssignable)
  
     $SearchTerm = $GroupNameOrId.Trim()
     if ([System.String]::IsNullOrWhiteSpace($SearchTerm))
@@ -1232,8 +1290,7 @@ function Get-ExistingPimGroup
         $EscapedDisplayName = $SearchTerm.Replace("'", "''")
         $Filter = "displayName eq '$EscapedDisplayName'"
         $Uri = 'https://graph.microsoft.com/v1.0/groups?$filter=' + [uri]::EscapeDataString($Filter) + '&$select=id,displayName,securityEnabled,mailEnabled,isAssignableToRole,groupTypes,onPremisesSyncEnabled&$top=2'
-        $Response = Invoke-PimGraphRequest -Method GET -Uri $Uri
-        $GroupMatches = @($Response.value)
+        $GroupMatches = @(Get-GraphCollection -Uri $Uri)
         if ($GroupMatches.Count -eq 0)
         {
             throw "No group with the exact display name '$SearchTerm' was found. No settings were changed."
@@ -1245,13 +1302,17 @@ function Get-ExistingPimGroup
         $Group = $GroupMatches[0]
     }
 
+    $VerifiedId = [guid]::Empty
+    $IsSecurityGroup = $Group.securityEnabled -eq $true -and $Group.mailEnabled -eq $false
+    $IsMicrosoft365Group = $Group.mailEnabled -eq $true -and @($Group.groupTypes) -contains 'Unified'
     if (($IsObjectId -and $Group.id -ne $ParsedId.ToString()) -or
-        [string]::IsNullOrWhiteSpace($Group.id) -or [string]::IsNullOrWhiteSpace($Group.displayName) -or
-        $Group.securityEnabled -ne $true -or $Group.mailEnabled -ne $false -or
-        $Group.isAssignableToRole -ne $true -or $Group.onPremisesSyncEnabled -eq $true -or
-        @($Group.groupTypes) -contains 'DynamicMembership')
+        -not [guid]::TryParse([string]$Group.id, [ref]$VerifiedId) -or [string]::IsNullOrWhiteSpace($Group.displayName) -or
+        (-not $IsSecurityGroup -and -not ($AllowNonRoleAssignable -and $IsMicrosoft365Group)) -or
+        (-not $AllowNonRoleAssignable -and $Group.isAssignableToRole -ne $true) -or
+        $Group.onPremisesSyncEnabled -eq $true -or @($Group.groupTypes) -contains 'DynamicMembership')
     {
-        throw "Group '$($Group.displayName)' [$($Group.id)] is not a verified cloud-only, role-assignable security group with assigned membership. No settings were changed."
+        $Requirement = if ($AllowNonRoleAssignable) { 'cloud-only security or Microsoft 365 group with assigned membership' } else { 'cloud-only, role-assignable security group with assigned membership' }
+        throw "Group '$($Group.displayName)' [$($Group.id)] is not a verified $Requirement. No settings were changed."
     }
     return $Group
 }
@@ -1293,23 +1354,35 @@ function Add-PimEligibleMember
         [System.String]$UserPrincipalName,
  
         [Parameter(Mandatory = $true)]
-        [System.Object]$Configuration
+        [System.Object]$Configuration,
+
+        [AllowNull()]
+        [System.Collections.IDictionary]$ScheduleInfo,
+
+        [AllowNull()]
+        [System.Object]$ResolvedUser
     )
  
-    $User = Get-EntraUserByUpn -UserPrincipalName $UserPrincipalName
-    $ScheduleInfo = @{
-        startDateTime = [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
-    }
- 
-    if ($Configuration.AllowPermanentEligibleAssignments)
+    $User = if ($ResolvedUser) { $ResolvedUser } else { Get-EntraUserByUpn -UserPrincipalName $UserPrincipalName }
+    if ([string]::IsNullOrWhiteSpace([string]$User.id) -or $User.userPrincipalName -ne $UserPrincipalName)
     {
-        $ScheduleInfo.expiration = @{ type = 'noExpiration' }
+        throw "Could not verify the resolved user for '$UserPrincipalName'."
     }
-    else
+    if ($null -eq $ScheduleInfo)
     {
-        $ScheduleInfo.expiration = @{
-            type        = 'afterDateTime'
-            endDateTime = [DateTime]::UtcNow.AddDays($Configuration.EligibleAssignmentDays).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
+        $ScheduleInfo = @{
+            startDateTime = [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
+        }
+        if ($Configuration.AllowPermanentEligibleAssignments)
+        {
+            $ScheduleInfo.expiration = @{ type = 'noExpiration' }
+        }
+        else
+        {
+            $ScheduleInfo.expiration = @{
+                type        = 'afterDateTime'
+                endDateTime = [DateTime]::UtcNow.AddDays($Configuration.EligibleAssignmentDays).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
+            }
         }
     }
  
@@ -1337,6 +1410,43 @@ function Add-PimEligibleMember
         throw "Eligible member request for '$UserPrincipalName' in group $GroupId failed: $($_.Exception.Message) $($_.ErrorDetails.Message)"
     }
     Write-UiLog -Message "Eligible member assignment request accepted for '$UserPrincipalName' [$($User.id)] in group $GroupId." -Required
+}
+
+function New-EligibleAssignmentSchedule
+{
+    param(
+        [bool]$StartNow,
+        [datetime]$StartLocal,
+        [bool]$Permanent,
+        [datetime]$EndLocal,
+        [datetime]$NowUtc = [datetime]::UtcNow
+    )
+
+    $TimeZone = [System.TimeZoneInfo]::Local
+    $Start = [datetime]::SpecifyKind($StartLocal, [DateTimeKind]::Unspecified)
+    $End = [datetime]::SpecifyKind($EndLocal, [DateTimeKind]::Unspecified)
+    if (-not $StartNow -and ($TimeZone.IsInvalidTime($Start) -or $TimeZone.IsAmbiguousTime($Start)))
+    {
+        throw 'The selected start time is invalid or ambiguous in the local time zone. Choose another time.'
+    }
+    if (-not $Permanent -and ($TimeZone.IsInvalidTime($End) -or $TimeZone.IsAmbiguousTime($End)))
+    {
+        throw 'The selected end time is invalid or ambiguous in the local time zone. Choose another time.'
+    }
+    $StartUtc = if ($StartNow) { $NowUtc } else { [System.TimeZoneInfo]::ConvertTimeToUtc($Start, $TimeZone) }
+    if (-not $StartNow -and $StartUtc -lt $NowUtc) { throw 'The start time must not be in the past.' }
+    $ScheduleInfo = @{ startDateTime = $StartUtc.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'") }
+    if ($Permanent)
+    {
+        $ScheduleInfo.expiration = @{ type = 'noExpiration' }
+    }
+    else
+    {
+        $EndUtc = [System.TimeZoneInfo]::ConvertTimeToUtc($End, $TimeZone)
+        if ($EndUtc -le $StartUtc) { throw 'The end time must be after the start time.' }
+        $ScheduleInfo.expiration = @{ type = 'afterDateTime'; endDateTime = $EndUtc.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'") }
+    }
+    return $ScheduleInfo
 }
  
 # ==================================================
@@ -1608,7 +1718,7 @@ function Write-AssignmentReportFile
         }
         else
         {
-            $SafeRows | Export-Excel -Path $TempPath -WorksheetName 'Assignments' -AutoSize -FreezeTopRow -AutoFilter -NoNumberConversion '*' -NoHyperLinkConversion '*'
+            $SafeRows | Export-Excel -Path $TempPath -WorksheetName 'Assignments' -TableName 'PIMAssignments' -TableStyle Light20 -AutoSize -FreezeTopRow -AutoFilter -NoNumberConversion '*' -NoHyperLinkConversion '*'
         }
         Move-Item -LiteralPath $TempPath -Destination $Path -Force -ErrorAction Stop
     }
@@ -1640,6 +1750,487 @@ function Export-AssignmentReport
 
 # ==================================================
 # ^^^^^ Read-only Assignment Reports ^^^^^
+# ==================================================
+
+# ==================================================
+# MARK: Existing Group Eligible Assignments
+# ==================================================
+
+function Get-MemberManagementGroupNameOrId
+{
+    if ([string]::IsNullOrWhiteSpace($Script:ReportGroupBox.Text))
+    {
+        throw 'Enter a group name or object ID in One group on the Assignments tab before adding or removing members.'
+    }
+    return $Script:ReportGroupBox.Text.Trim()
+}
+
+function Show-AddEligibleMembers
+{
+    $GroupNameOrId = Get-MemberManagementGroupNameOrId
+    $Dialog = New-Object System.Windows.Forms.Form
+    try
+    {
+        $Dialog.Text = 'Add eligible members'
+        $Dialog.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+        $Dialog.Size = New-Object System.Drawing.Size(670, 430)
+        $Dialog.MinimumSize = $Dialog.Size
+        $Dialog.Font = $Script:MainForm.Font
+        $Dialog.BackColor = [System.Drawing.Color]::White
+        [void](Add-UiLabel -Parent $Dialog -Text 'Group Name or ID' -X 18 -Y 18 -Width 140)
+        $GroupLabel = Add-UiLabel -Parent $Dialog -Text $GroupNameOrId -X 165 -Y 18 -Width 460 -Height 28
+        $GroupLabel.Font = New-Object System.Drawing.Font($Dialog.Font.FontFamily, ($Dialog.Font.Size + 1), [System.Drawing.FontStyle]::Bold)
+        $GroupLabel.AutoEllipsis = $true
+        [void](Add-UiLabel -Parent $Dialog -Text 'User UPNs' -X 18 -Y 57 -Width 140)
+        $MembersBox = Add-UiTextBox -Parent $Dialog -X 165 -Y 57 -Width 460 -Height 70 -Multiline $true
+        [void](Add-UiLabel -Parent $Dialog -Text 'Separate UPNs with commas, semicolons, or new lines.' -X 165 -Y 130 -Width 460)
+        $Now = [datetime]::Now
+        $StartNowBox = Add-UiCheckBox -Parent $Dialog -Text 'Start now' -X 18 -Y 169 -Checked $true -Width 130
+        $StartPicker = New-Object System.Windows.Forms.DateTimePicker
+        $StartPicker.Format = [System.Windows.Forms.DateTimePickerFormat]::Custom
+        $StartPicker.CustomFormat = 'yyyy-MM-dd HH:mm:ss'
+        $StartPicker.Location = New-Object System.Drawing.Point(165, 169)
+        $StartPicker.Size = New-Object System.Drawing.Size(220, 24)
+        $StartPicker.Value = $Now
+        $StartPicker.Enabled = $false
+        $Dialog.Controls.Add($StartPicker)
+        $StartNowBox.Add_CheckedChanged({ $StartPicker.Enabled = -not $StartNowBox.Checked }.GetNewClosure())
+        [void](Add-UiLabel -Parent $Dialog -Text 'End (local time)' -X 18 -Y 207 -Width 140)
+        $EndPicker = New-Object System.Windows.Forms.DateTimePicker
+        $EndPicker.Format = [System.Windows.Forms.DateTimePickerFormat]::Custom
+        $EndPicker.CustomFormat = 'yyyy-MM-dd HH:mm:ss'
+        $EndPicker.Location = New-Object System.Drawing.Point(165, 207)
+        $EndPicker.Size = New-Object System.Drawing.Size(220, 24)
+        $EndPicker.Value = $Now.ToUniversalTime().AddDays(365).ToLocalTime()
+        $Dialog.Controls.Add($EndPicker)
+        $PermanentBox = Add-UiCheckBox -Parent $Dialog -Text 'Permanent eligibility (if allowed by policy)' -X 165 -Y 243 -Checked $false -Width 400
+        $PermanentBox.Add_CheckedChanged({ $EndPicker.Enabled = -not $PermanentBox.Checked }.GetNewClosure())
+        $Hint = Add-UiLabel -Parent $Dialog -Text 'Dates and times use this computer''s local time. The group''s PIM policy may reject the requested schedule.' -X 18 -Y 278 -Width 600 -Height 38
+        $Hint.ForeColor = [System.Drawing.Color]::DimGray
+        $SubmitButton = New-Object System.Windows.Forms.Button
+        $SubmitButton.Text = 'Review assignments'
+        $SubmitButton.Location = New-Object System.Drawing.Point(315, 333)
+        $SubmitButton.Size = New-Object System.Drawing.Size(150, 34)
+        $SubmitButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        Set-UiButtonStyle -Button $SubmitButton -Primary $true
+        $Dialog.Controls.Add($SubmitButton)
+        $CancelButton = New-Object System.Windows.Forms.Button
+        $CancelButton.Text = 'Cancel'
+        $CancelButton.Location = New-Object System.Drawing.Point(475, 333)
+        $CancelButton.Size = New-Object System.Drawing.Size(150, 34)
+        $CancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+        Set-UiButtonStyle -Button $CancelButton
+        $Dialog.Controls.Add($CancelButton)
+        $Dialog.AcceptButton = $SubmitButton
+        $Dialog.CancelButton = $CancelButton
+
+        while ($true)
+        {
+            if ($Dialog.ShowDialog($Script:MainForm) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+            try
+            {
+                $Upns = @(ConvertTo-EligibleMemberUPNs -Text $MembersBox.Text)
+                if ($Upns.Count -eq 0) { throw 'Enter at least one user UPN.' }
+                $ScheduleInfo = New-EligibleAssignmentSchedule -StartNow $StartNowBox.Checked -StartLocal $StartPicker.Value `
+                    -Permanent $PermanentBox.Checked -EndLocal $EndPicker.Value
+                break
+            }
+            catch { Show-Message -Message $_.Exception.Message -Title 'Invalid assignment details' -Icon Error }
+        }
+
+        $Script:TabControl.Enabled = $false
+        $ConnectionGroup.Enabled = $false
+        $Script:AuditBrowseButton.Enabled = $false
+        $Script:MainForm.UseWaitCursor = $true
+        [System.Windows.Forms.Application]::DoEvents()
+        try
+        {
+            Assert-GraphReady
+            $Group = Get-ExistingPimGroup -GroupNameOrId $GroupNameOrId -AllowNonRoleAssignable
+            $Users = @()
+            foreach ($Upn in $Upns) { $Users += Get-EntraUserByUpn -UserPrincipalName $Upn }
+            $StartDescription = if ($StartNowBox.Checked) { 'At submission' } else { $StartPicker.Value.ToString('yyyy-MM-dd HH:mm:ss') }
+            $EndDescription = if ($PermanentBox.Checked) { 'Permanent' } else { $EndPicker.Value.ToString('yyyy-MM-dd HH:mm:ss') }
+            $Summary = "Add PIM-eligible members to:`r`n$($Group.displayName)`r`nGroup ID: $($Group.id)`r`n`r`nUsers: $($Upns -join ', ')`r`nStart: $StartDescription`r`nEnd: $EndDescription`r`nTimes are local.`r`n`r`nThis may onboard the group to PIM if it is not already managed; onboarding cannot be undone. This does not grant active membership. Continue?"
+            if ([System.Windows.Forms.MessageBox]::Show($Script:MainForm, $Summary, 'Confirm eligible assignments',
+                [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning) -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+            $Script:ReportGroupBox.Text = $Group.id
+            $Script:ReportRows = @()
+            $Script:ReportGrid.Rows.Clear()
+            $Script:ReportExportButton.Enabled = $false
+            $Script:ReportStatus.Text = 'Assignments may have changed; run a new report.'
+            $Accepted = [System.Collections.Generic.List[string]]::new()
+            $Configuration = @{ AllowPermanentEligibleAssignments = $PermanentBox.Checked }
+            for ($Index = 0; $Index -lt $Upns.Count; $Index++)
+            {
+                try
+                {
+                    if ($StartNowBox.Checked)
+                    {
+                        $ScheduleInfo = New-EligibleAssignmentSchedule -StartNow $true -StartLocal $StartPicker.Value `
+                            -Permanent $PermanentBox.Checked -EndLocal $EndPicker.Value
+                    }
+                    Add-PimEligibleMember -GroupId $Group.id -UserPrincipalName $Upns[$Index] -Configuration $Configuration `
+                        -ScheduleInfo $ScheduleInfo -ResolvedUser $Users[$Index]
+                    $Accepted.Add($Upns[$Index])
+                }
+                catch
+                {
+                    $Remaining = @($Upns | Select-Object -Skip ($Index + 1))
+                    $Details = "Accepted requests: $(if ($Accepted.Count) { $Accepted -join ', ' } else { 'none' }).`r`nFailed or uncertain: $($Upns[$Index]).`r`nNot attempted: $(if ($Remaining.Count) { $Remaining -join ', ' } else { 'none' }).`r`n`r`n$($_.Exception.Message)`r`n`r`nA failed request may have been accepted before the error. Check Entra PIM before retrying."
+                    Write-UiLog "Eligible assignment batch stopped for group $($Group.id): $Details"
+                    Show-Message -Message $Details -Title 'Eligible assignments incomplete' -Icon Error
+                    return
+                }
+            }
+            Show-Message -Message "Submitted $($Accepted.Count) eligible-member request(s) for $($Group.displayName) [$($Group.id)].`r`n`r`nCheck Entra PIM for provisioning and assignment status."
+        }
+        finally
+        {
+            $Script:TabControl.Enabled = $true
+            $ConnectionGroup.Enabled = $true
+            $Script:AuditBrowseButton.Enabled = $true
+            $Script:MainForm.UseWaitCursor = $false
+        }
+    }
+    finally { $Dialog.Dispose() }
+}
+
+# ==================================================
+# ^^^^^ Existing Group Eligible Assignments ^^^^^
+# ==================================================
+
+# ==================================================
+# MARK: Existing Group Member Removal
+# ==================================================
+
+function Get-MemberRemovalPlan
+{
+    param(
+        [Parameter(Mandatory = $true)]$Group,
+        [Parameter(Mandatory = $true)][object[]]$Users,
+        [bool]$Eligible,
+        [bool]$Active,
+        [bool]$Direct
+    )
+
+    $GroupId = [guid]::Empty
+    if (-not [guid]::TryParse([string]$Group.id, [ref]$GroupId)) { throw 'The group ID is invalid.' }
+    if (-not ($Eligible -or $Active -or $Direct)) { throw 'Select at least one removal category.' }
+    $UserById = @{}
+    foreach ($User in $Users)
+    {
+        $UserId = [guid]::Empty
+        if (-not [guid]::TryParse([string]$User.id, [ref]$UserId) -or [string]::IsNullOrWhiteSpace([string]$User.userPrincipalName))
+        {
+            throw 'Graph returned a user without a valid ID and UPN.'
+        }
+        $UserById[$UserId.ToString()] = $User
+    }
+
+    $Plan = [System.Collections.Generic.List[object]]::new()
+    $Filter = [uri]::EscapeDataString("groupId eq '$GroupId'")
+    foreach ($Kind in @('assignmentSchedules', 'eligibilitySchedules'))
+    {
+        if (($Kind -eq 'assignmentSchedules' -and -not $Active) -or
+            ($Kind -eq 'eligibilitySchedules' -and -not $Eligible)) { continue }
+        $Uri = "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/${Kind}?`$filter=$Filter"
+        $Seen = @{}
+        foreach ($Schedule in @(Get-GraphCollection -Uri $Uri))
+        {
+            if ($Schedule.groupId -ne $GroupId.ToString()) { throw "Graph returned a schedule outside group $GroupId." }
+            if ($Schedule.accessId -ne 'member' -or -not $UserById.ContainsKey([string]$Schedule.principalId)) { continue }
+            if ($Schedule.memberType -eq 'group') { continue }
+            if ($Schedule.memberType -ne 'direct' -or [string]::IsNullOrWhiteSpace([string]$Schedule.id))
+            {
+                throw "Cannot safely classify a membership schedule for $($Schedule.principalId)."
+            }
+            if ($Schedule.status -in @('Canceled', 'Denied', 'Failed', 'Revoked')) { continue }
+            if ($Schedule.status -notin @('Provisioned', 'ScheduleCreated'))
+            {
+                throw "Membership schedule $($Schedule.id) has status '$($Schedule.status)'. Review it in Entra before removing access."
+            }
+            if ($Kind -eq 'assignmentSchedules' -and $Schedule.assignmentType -notin @('assigned', 'activated'))
+            {
+                throw "Cannot safely classify active schedule $($Schedule.id)."
+            }
+            $User = $UserById[[string]$Schedule.principalId]
+            if ($Seen.ContainsKey([string]$User.id))
+            {
+                throw "Multiple $Kind exist for $($User.userPrincipalName). Review them in Entra before removing access."
+            }
+            $Seen[[string]$User.id] = $true
+            $Category = if ($Kind -eq 'assignmentSchedules') { 'PIM active' } else { 'PIM eligible' }
+            $Plan.Add([pscustomobject]@{
+                Category = $Category; UserPrincipalName = $User.userPrincipalName; UserId = $User.id
+                Detail = "Schedule: $($Schedule.id); status: $($Schedule.status); type: $($Schedule.assignmentType); schedule: $(ConvertTo-Json -InputObject $Schedule.scheduleInfo -Depth 6 -Compress)"
+            })
+        }
+    }
+    if ($Direct)
+    {
+        $Uri = "https://graph.microsoft.com/v1.0/groups/$GroupId/members?`$select=id"
+        foreach ($Member in @(Get-GraphCollection -Uri $Uri))
+        {
+            if ([string]::IsNullOrWhiteSpace([string]$Member.id)) { throw "Graph returned a group member without an ID." }
+            if ($UserById.ContainsKey([string]$Member.id))
+            {
+                $User = $UserById[[string]$Member.id]
+                $Plan.Add([pscustomobject]@{
+                    Category = 'Group membership'; UserPrincipalName = $User.userPrincipalName
+                    UserId = $User.id; Detail = 'Direct members relationship (may be PIM-provisioned)'
+                })
+            }
+        }
+    }
+    return $Plan.ToArray()
+}
+
+function Invoke-MemberRemoval
+{
+    param([Parameter(Mandatory = $true)][string]$GroupId, [Parameter(Mandatory = $true)]$Operation)
+    $ParsedGroup = [guid]::Empty
+    $ParsedUser = [guid]::Empty
+    if (-not [guid]::TryParse($GroupId, [ref]$ParsedGroup) -or
+        -not [guid]::TryParse([string]$Operation.UserId, [ref]$ParsedUser))
+    {
+        throw 'Invalid group or user ID; no removal request was sent.'
+    }
+    if ($Operation.Category -notin @('PIM active', 'PIM eligible', 'Group membership'))
+    {
+        throw 'Invalid removal category; no removal request was sent.'
+    }
+    Write-UiLog -Message "Removing $($Operation.Category) for '$($Operation.UserPrincipalName)' [$ParsedUser] from group $ParsedGroup. $($Operation.Detail)" -Required
+    if ($Operation.Category -eq 'Group membership')
+    {
+        $Uri = "https://graph.microsoft.com/v1.0/groups/$ParsedGroup/members/$ParsedUser/`$ref"
+        Invoke-MgGraphRequest -Method DELETE -Uri $Uri -ErrorAction Stop | Out-Null
+        $Result = 'Group membership DELETE accepted'
+    }
+    else
+    {
+        $Endpoint = if ($Operation.Category -eq 'PIM active') { 'assignmentScheduleRequests' } else { 'eligibilityScheduleRequests' }
+        $Body = @{
+            action = 'adminRemove'; accessId = 'member'; groupId = $ParsedGroup.ToString(); principalId = $ParsedUser.ToString()
+            justification = 'Membership removal requested by PIM Group Manager.'
+        }
+        $Response = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/$Endpoint" `
+            -Body ($Body | ConvertTo-Json -Depth 8) -ContentType 'application/json' -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace([string]$Response.id) -or [string]::IsNullOrWhiteSpace([string]$Response.status))
+        {
+            throw 'Graph returned no request ID or status; the removal outcome is uncertain.'
+        }
+        if ($Response.status -in @('Canceled', 'Denied', 'Failed', 'Revoked'))
+        {
+            throw "PIM request $($Response.id) returned status $($Response.status); review it in Entra."
+        }
+        $Result = "PIM request $($Response.id), status $($Response.status)"
+    }
+    Write-UiLog -Message "$Result for $($Operation.UserPrincipalName) [$ParsedUser] in group $ParsedGroup." -Required
+    return $Result
+}
+
+function Invoke-MemberRemovalBatch
+{
+    param([Parameter(Mandatory = $true)][string]$GroupId, [Parameter(Mandatory = $true)][object[]]$Plan)
+    $Accepted = [System.Collections.Generic.List[string]]::new()
+    for ($Index = 0; $Index -lt $Plan.Count; $Index++)
+    {
+        $Operation = $Plan[$Index]
+        try
+        {
+            $Result = Invoke-MemberRemoval -GroupId $GroupId -Operation $Operation
+            $Accepted.Add("$($Operation.UserPrincipalName) - $($Operation.Category): $Result")
+        }
+        catch
+        {
+            return [pscustomobject]@{
+                Accepted = $Accepted.ToArray()
+                Failed = "$($Operation.UserPrincipalName) - $($Operation.Category)"
+                Remaining = @($Plan | Select-Object -Skip ($Index + 1) | ForEach-Object { "$($_.UserPrincipalName) - $($_.Category)" })
+                ErrorMessage = $_.Exception.Message
+            }
+        }
+    }
+    return [pscustomobject]@{ Accepted = $Accepted.ToArray(); Failed = $null; Remaining = @(); ErrorMessage = $null }
+}
+
+function Request-MemberRemovalScopes
+{
+    param([string[]]$RequiredScopes)
+    $Context = Get-GraphContext
+    $Missing = @($RequiredScopes | Where-Object { $Context.Scopes -notcontains $_ })
+    if ($Missing.Count -eq 0) { return }
+    $Prompt = "Removal needs additional Graph permissions: $($Missing -join ', '). Reconnect to request consent? An administrator may need to grant it."
+    if ([System.Windows.Forms.MessageBox]::Show($Script:MainForm, $Prompt, 'Additional Graph permissions',
+        [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question) -ne [System.Windows.Forms.DialogResult]::Yes)
+    {
+        throw 'Additional permissions were not requested; no memberships were changed.'
+    }
+    $OriginalAccount = $Context.Account
+    $OriginalTenant = $Context.TenantId
+    Write-UiLog "Requesting Graph consent for member removal: $($Missing -join ', ')."
+    Connect-MgGraph -Scopes @($Script:GraphScopes + $Script:ReportScope + $RequiredScopes | Select-Object -Unique) `
+        -TenantId $OriginalTenant -ContextScope Process -ErrorAction Stop | Out-Null
+    $Context = Get-GraphContext
+    if ($null -eq $Context -or $Context.Account -ne $OriginalAccount -or $Context.TenantId -ne $OriginalTenant)
+    {
+        $Script:ConnectionStatusLabel.Text = 'Connection changed; check connection'
+        $Script:ConnectionStatusLabel.ForeColor = [System.Drawing.Color]::DarkOrange
+        throw 'The Graph account or tenant changed during sign-in. Check the connection and start again.'
+    }
+    [void](Test-GraphConnection)
+    Assert-GraphReady
+    $Missing = @($RequiredScopes | Where-Object { $Context.Scopes -notcontains $_ })
+    if ($Missing.Count) { throw "Missing Graph permissions: $($Missing -join ', '). No memberships were changed." }
+}
+
+function Show-RemoveMembers
+{
+    $GroupNameOrId = Get-MemberManagementGroupNameOrId
+    $Dialog = New-Object System.Windows.Forms.Form
+    try
+    {
+        $Dialog.Text = 'Remove members'
+        $Dialog.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+        $Dialog.Size = New-Object System.Drawing.Size(670, 435)
+        $Dialog.MinimumSize = $Dialog.Size
+        $Dialog.Font = $Script:MainForm.Font
+        $Dialog.BackColor = [System.Drawing.Color]::White
+        [void](Add-UiLabel -Parent $Dialog -Text 'Group Name or ID' -X 18 -Y 18 -Width 140)
+        $GroupLabel = Add-UiLabel -Parent $Dialog -Text $GroupNameOrId -X 165 -Y 18 -Width 460 -Height 28
+        $GroupLabel.Font = New-Object System.Drawing.Font($Dialog.Font.FontFamily, ($Dialog.Font.Size + 1), [System.Drawing.FontStyle]::Bold)
+        $GroupLabel.AutoEllipsis = $true
+        [void](Add-UiLabel -Parent $Dialog -Text 'User UPNs' -X 18 -Y 57 -Width 140)
+        $MembersBox = Add-UiTextBox -Parent $Dialog -X 165 -Y 57 -Width 460 -Height 70 -Multiline $true
+        [void](Add-UiLabel -Parent $Dialog -Text 'Separate UPNs with commas, semicolons, or new lines.' -X 165 -Y 130 -Width 460)
+        [void](Add-UiLabel -Parent $Dialog -Text 'Select what to remove:' -X 18 -Y 166 -Width 140)
+        $ActiveBox = Add-UiCheckBox -Parent $Dialog -Text 'PIM active membership schedules' -X 165 -Y 166 -Checked $false -Width 400
+        $EligibleBox = Add-UiCheckBox -Parent $Dialog -Text 'PIM eligible membership schedules' -X 165 -Y 193 -Checked $false -Width 400
+        $DirectBox = Add-UiCheckBox -Parent $Dialog -Text 'Direct group members relationship' -X 165 -Y 220 -Checked $false -Width 400
+        $Hint = Add-UiLabel -Parent $Dialog -Text 'PIM active membership also appears as a direct group member. Removing either can affect active access; eligibility can still allow reactivation. Nested access and owners are not removed.' -X 18 -Y 255 -Width 610 -Height 55
+        $Hint.ForeColor = [System.Drawing.Color]::DimGray
+        $SubmitButton = New-Object System.Windows.Forms.Button
+        $SubmitButton.Text = 'Review removals'
+        $SubmitButton.Location = New-Object System.Drawing.Point(315, 333)
+        $SubmitButton.Size = New-Object System.Drawing.Size(150, 34)
+        $SubmitButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        Set-UiButtonStyle -Button $SubmitButton -Primary $true
+        $Dialog.Controls.Add($SubmitButton)
+        $CancelButton = New-Object System.Windows.Forms.Button
+        $CancelButton.Text = 'Cancel'
+        $CancelButton.Location = New-Object System.Drawing.Point(475, 333)
+        $CancelButton.Size = New-Object System.Drawing.Size(150, 34)
+        $CancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+        Set-UiButtonStyle -Button $CancelButton
+        $Dialog.Controls.Add($CancelButton)
+        $Dialog.AcceptButton = $SubmitButton
+        $Dialog.CancelButton = $CancelButton
+        while ($true)
+        {
+            if ($Dialog.ShowDialog($Script:MainForm) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+            try
+            {
+                $Upns = @(ConvertTo-EligibleMemberUPNs -Text $MembersBox.Text)
+                if ($Upns.Count -eq 0) { throw 'Enter at least one user UPN.' }
+                if (-not ($ActiveBox.Checked -or $EligibleBox.Checked -or $DirectBox.Checked)) { throw 'Select at least one removal category.' }
+                break
+            }
+            catch { Show-Message -Message $_.Exception.Message -Title 'Invalid removal details' -Icon Error }
+        }
+        $Script:TabControl.Enabled = $false
+        $ConnectionGroup.Enabled = $false
+        $Script:AuditBrowseButton.Enabled = $false
+        $Script:MainForm.UseWaitCursor = $true
+        [System.Windows.Forms.Application]::DoEvents()
+        try
+        {
+            Assert-GraphReady
+            $Group = Get-ExistingPimGroup -GroupNameOrId $GroupNameOrId -AllowNonRoleAssignable
+            $Scopes = @()
+            if ($ActiveBox.Checked) { $Scopes += $Script:AssignmentWriteScope }
+            if ($DirectBox.Checked -and $Group.isAssignableToRole -eq $true) { $Scopes += $Script:RoleManagementWriteScope }
+            if ($Scopes.Count) { Request-MemberRemovalScopes -RequiredScopes $Scopes }
+            $Users = @()
+            foreach ($Upn in $Upns)
+            {
+                $User = Get-EntraUserByUpn -UserPrincipalName $Upn
+                if ($User.userPrincipalName -ne $Upn) { throw "Could not verify the resolved user for '$Upn'." }
+                $Users += $User
+            }
+            $Plan = @(Get-MemberRemovalPlan -Group $Group -Users $Users -Eligible $EligibleBox.Checked -Active $ActiveBox.Checked -Direct $DirectBox.Checked)
+            if ($Plan.Count -eq 0)
+            {
+                Show-Message -Message 'No matching direct memberships or PIM membership schedules were found for the selected categories. Indirect or nested access is not evaluated.' -Title 'No matching removals'
+                return
+            }
+            $Lines = @($Plan | ForEach-Object { "$($_.UserPrincipalName) [$($_.UserId)] - $($_.Category): $($_.Detail)" })
+            $Categories = @()
+            if ($ActiveBox.Checked) { $Categories += 'PIM active' }
+            if ($EligibleBox.Checked) { $Categories += 'PIM eligible' }
+            if ($DirectBox.Checked) { $Categories += 'Group membership' }
+            $Summary = "Group: $($Group.displayName) [$($Group.id)]`r`nRequested users: $($Upns -join ', ')`r`nSelected categories: $($Categories -join ', ')`r`n`r`nMatching operations:`r`n$($Lines -join "`r`n")`r`n`r`nOnly the matching operations listed above will be submitted. PIM schedules may include future assignments. Removing an active PIM assignment or direct group membership can affect the same access. Removing eligibility may not end an existing activation; users may retain access through other paths. PIM requests can take time to provision. Continue?"
+            $Review = New-Object System.Windows.Forms.Form
+            try
+            {
+                $Review.Text = 'Confirm member removals'
+                $Review.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+                $Review.Size = New-Object System.Drawing.Size(760, 500)
+                $Review.Font = $Script:MainForm.Font
+                $Details = Add-UiTextBox -Parent $Review -X 15 -Y 15 -Width 710 -Height 390 -Multiline $true
+                $Details.ReadOnly = $true
+                $Details.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+                $Details.Anchor = 'Top, Bottom, Left, Right'
+                $Details.Text = $Summary
+                $Confirm = New-Object System.Windows.Forms.Button
+                $Confirm.Text = 'Remove selected access'
+                $Confirm.Location = New-Object System.Drawing.Point(410, 415)
+                $Confirm.Size = New-Object System.Drawing.Size(190, 34)
+                $Confirm.Anchor = 'Bottom, Right'
+                $Confirm.DialogResult = [System.Windows.Forms.DialogResult]::Yes
+                Set-UiButtonStyle -Button $Confirm -Primary $true
+                $Review.Controls.Add($Confirm)
+                $Cancel = New-Object System.Windows.Forms.Button
+                $Cancel.Text = 'Cancel'
+                $Cancel.Location = New-Object System.Drawing.Point(610, 415)
+                $Cancel.Size = New-Object System.Drawing.Size(115, 34)
+                $Cancel.Anchor = 'Bottom, Right'
+                $Cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+                Set-UiButtonStyle -Button $Cancel
+                $Review.Controls.Add($Cancel)
+                $Review.CancelButton = $Cancel
+                if ($Review.ShowDialog($Script:MainForm) -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+            }
+            finally { $Review.Dispose() }
+            $Script:ReportGroupBox.Text = $Group.id
+            $Script:ReportRows = @()
+            $Script:ReportGrid.Rows.Clear()
+            $Script:ReportExportButton.Enabled = $false
+            $Script:ReportStatus.Text = 'Assignments may have changed; run a new report.'
+            $Outcome = Invoke-MemberRemovalBatch -GroupId $Group.id -Plan $Plan
+            if ($Outcome.Failed)
+            {
+                $Details = "Accepted: $(if ($Outcome.Accepted.Count) { $Outcome.Accepted -join '; ' } else { 'none' }).`r`nFailed or uncertain: $($Outcome.Failed).`r`nNot attempted: $(if ($Outcome.Remaining.Count) { $Outcome.Remaining -join '; ' } else { 'none' }).`r`n`r`n$($Outcome.ErrorMessage)`r`n`r`nA request may have succeeded before the error. Check Entra PIM and group membership before retrying."
+                Write-UiLog "Member removal batch stopped for group $($Group.id): $Details"
+                Show-Message -Message $Details -Title 'Member removals incomplete' -Icon Error
+                return
+            }
+            Show-Message -Message "Removal requests submitted:`r`n$($Outcome.Accepted -join "`r`n")`r`n`r`nVerify PIM request statuses and group membership in Entra; accepted requests do not guarantee completed removal."
+        }
+        finally
+        {
+            $Script:TabControl.Enabled = $true
+            $ConnectionGroup.Enabled = $true
+            $Script:AuditBrowseButton.Enabled = $true
+            $Script:MainForm.UseWaitCursor = $false
+        }
+    }
+    finally { $Dialog.Dispose() }
+}
+
+# ==================================================
+# ^^^^^ Existing Group Member Removal ^^^^^
 # ==================================================
 
 # ==================================================
@@ -1973,7 +2564,7 @@ function New-TemplateFile
         $Template.AllowPermanentEligibleAssignments = $false
         $Template.EligibleAssignmentDays = 365
         $Template.AllowPermanentActiveAssignments = $false
-        [PSCustomObject]$Template | Export-Excel -Path $Dialog.FileName -WorksheetName 'Groups' -AutoSize -TableName 'PIMGroupTemplate'
+        [PSCustomObject]$Template | Export-Excel -Path $Dialog.FileName -WorksheetName 'Groups' -AutoSize -TableName 'PIMGroupTemplate' -TableStyle Light20
     }
     else
     {
@@ -2254,6 +2845,7 @@ function Set-UiButtonStyle
 $Script:MainForm = New-Object System.Windows.Forms.Form
 $Script:MainForm.Text = 'Microsoft Entra PIM Group Manager'
 $Script:MainForm.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+$Script:MainForm.TopMost = $true
 $Script:MainForm.Size = New-Object System.Drawing.Size(1040, 970)
 $Script:MainForm.MinimumSize = New-Object System.Drawing.Size(840, 680)
 $Script:MainForm.Font = New-Object System.Drawing.Font('Segoe UI', 9)
@@ -2310,6 +2902,36 @@ $Script:TabControl = New-Object System.Windows.Forms.TabControl
 $Script:TabControl.Location = New-Object System.Drawing.Point(12, 142)
 $Script:TabControl.Size = New-Object System.Drawing.Size(1000, 630)
 $Script:TabControl.Anchor = 'Top, Bottom, Left, Right'
+$Script:TabControl.SizeMode = [System.Windows.Forms.TabSizeMode]::Fixed
+$Script:TabControl.ItemSize = New-Object System.Drawing.Size(180, 40)
+$Script:TabControl.DrawMode = [System.Windows.Forms.TabDrawMode]::OwnerDrawFixed
+$Script:TabControl.Add_DrawItem({
+    param($Sender, $EventArgs)
+    $Selected = $EventArgs.Index -eq $Sender.SelectedIndex
+    $Background = if ($Selected) { [System.Drawing.Color]::FromArgb(36, 92, 176) } else { [System.Drawing.Color]::FromArgb(231, 237, 246) }
+    $Foreground = if ($Selected) { [System.Drawing.Color]::White } else { [System.Drawing.Color]::FromArgb(37, 52, 74) }
+    $Brush = New-Object System.Drawing.SolidBrush($Background)
+    $Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
+    try
+    {
+        $EventArgs.Graphics.FillRectangle($Brush, $EventArgs.Bounds)
+        [System.Windows.Forms.TextRenderer]::DrawText($EventArgs.Graphics, $Sender.TabPages[$EventArgs.Index].Text,
+            $Font, $EventArgs.Bounds, $Foreground,
+            ([System.Windows.Forms.TextFormatFlags]::HorizontalCenter -bor [System.Windows.Forms.TextFormatFlags]::VerticalCenter))
+        if ($Selected -and $Sender.ContainsFocus)
+        {
+            $FocusBounds = $EventArgs.Bounds
+            $FocusBounds.Inflate(-3, -3)
+            [System.Windows.Forms.ControlPaint]::DrawFocusRectangle($EventArgs.Graphics, $FocusBounds, $Foreground, $Background)
+        }
+    }
+    finally
+    {
+        $Font.Dispose()
+        $Brush.Dispose()
+    }
+})
+$Script:TabControl.Add_SelectedIndexChanged({ $Script:TabControl.Invalidate() })
 $Script:MainForm.Controls.Add($Script:TabControl)
  
 # ==================================================
@@ -2324,7 +2946,7 @@ $CreateTab = New-Object System.Windows.Forms.TabPage
 $CreateTab.Text = 'Create one group'
 $CreateTab.BackColor = [System.Drawing.Color]::White
 $CreateTab.AutoScroll = $true
-$CreateTab.AutoScrollMinSize = New-Object System.Drawing.Size(960, 592)
+$CreateTab.AutoScrollMinSize = New-Object System.Drawing.Size(960, 622)
 $Script:TabControl.TabPages.Add($CreateTab)
  
 [void](Add-UiLabel -Parent $CreateTab -Text 'Group name *' -X 18 -Y 16)
@@ -2385,7 +3007,7 @@ $Script:MembershipRuleLabel.Visible = $false
 $Script:MembershipTypeBox.Visible = $false
 $Script:MembershipTypeLabel.Visible = $false
  
-$Script:ExistingGroupIdLabel = Add-UiLabel -Parent $CreateTab -Text 'Existing group name or ID' -X 18 -Y 178
+$Script:ExistingGroupIdLabel = Add-UiLabel -Parent $CreateTab -Text 'Existing Group Name or ID' -X 18 -Y 178
 $Script:ExistingGroupIdBox = Add-UiTextBox -Parent $CreateTab -X 215 -Y 178 -Width 400
 $Script:ApplyExistingButton = New-Object System.Windows.Forms.Button
 $Script:ApplyExistingButton.Text = 'Apply PIM to existing group'
@@ -2397,28 +3019,52 @@ $Script:ExistingGroupHint = Add-UiLabel -Parent $CreateTab -Text 'Enter the exac
 $Script:PimGroupBox = New-Object System.Windows.Forms.GroupBox
 $Script:PimGroupBox.Text = 'PIM Member settings'
 $Script:PimGroupBox.Location = New-Object System.Drawing.Point(18, 276)
-$Script:PimGroupBox.Size = New-Object System.Drawing.Size(932, 200)
+$Script:PimGroupBox.Size = New-Object System.Drawing.Size(932, 230)
 $Script:PimGroupBox.ForeColor = [System.Drawing.Color]::FromArgb(37, 52, 74)
 $CreateTab.Controls.Add($Script:PimGroupBox)
 [void](Add-UiLabel -Parent $Script:PimGroupBox -Text 'Activation maximum (hours)' -X 14 -Y 28 -Width 240)
 $Script:ActivationHoursBox = Add-UiNumeric -Parent $Script:PimGroupBox -X 260 -Y 28 -Minimum 1 -Maximum 24 -Value 8
 $Script:RequireMfaActivationBox = Add-UiCheckBox -Parent $Script:PimGroupBox -Text 'Require MFA on activation' -X 375 -Y 28 -Checked $true
-[void](Add-UiLabel -Parent $Script:PimGroupBox -Text 'Eligible assignment expiry (days)' -X 14 -Y 62 -Width 240)
-$Script:EligibilityDaysBox = Add-UiNumeric -Parent $Script:PimGroupBox -X 260 -Y 62 -Minimum 1 -Maximum 3650 -Value 365
-$Script:AllowPermanentEligibleBox = Add-UiCheckBox -Parent $Script:PimGroupBox -Text 'Allow permanent eligible assignments' -X 375 -Y 62 -Checked $false
-$Script:AllowPermanentActiveBox = Add-UiCheckBox -Parent $Script:PimGroupBox -Text 'Allow permanent active assignments (not recommended)' -X 375 -Y 96 -Checked $false -Width 480
-[void](Add-UiLabel -Parent $Script:PimGroupBox -Text 'Active assignment expiry (days; blank keeps current default)' -X 14 -Y 96 -Width 345)
-$Script:ActiveAssignmentDaysBox = Add-UiTextBox -Parent $Script:PimGroupBox -X 260 -Y 126 -Width 90
-$Script:RequireMfaActiveBox = Add-UiCheckBox -Parent $Script:PimGroupBox -Text 'Require MFA on active assignment' -X 14 -Y 158 -Checked $true -Width 340
-$Script:RequireJustificationActiveBox = Add-UiCheckBox -Parent $Script:PimGroupBox -Text 'Require justification on active assignment' -X 375 -Y 158 -Checked $true -Width 440
- 
-$Script:EligibleMembersLabel = Add-UiLabel -Parent $CreateTab -Text 'Eligible member UPNs (optional; separate with ;)' -X 18 -Y 488 -Width 330 -Height 34
-$Script:EligibleMembersBox = Add-UiTextBox -Parent $CreateTab -X 350 -Y 488 -Width 600 -Height 50 -Multiline $true
-$CreateHint = Add-UiLabel -Parent $CreateTab -Text 'This assigns listed users as PIM-eligible members, not active members. Entra role assignment to the group is a separate step.' -X 18 -Y 544 -Width 745 -Height 42
+$EligiblePolicySection = New-Object System.Windows.Forms.GroupBox
+$EligiblePolicySection.Text = 'Eligible Assignments'
+$EligiblePolicySection.Location = New-Object System.Drawing.Point(14, 62)
+$EligiblePolicySection.Size = New-Object System.Drawing.Size(430, 154)
+$Script:PimGroupBox.Controls.Add($EligiblePolicySection)
+[void](Add-UiLabel -Parent $EligiblePolicySection -Text 'Eligible assignment expiry (days)' -X 12 -Y 26 -Width 245)
+$Script:EligibilityDaysBox = Add-UiNumeric -Parent $EligiblePolicySection -X 270 -Y 26 -Minimum 1 -Maximum 3650 -Value 365
+$Script:AllowPermanentEligibleBox = Add-UiCheckBox -Parent $EligiblePolicySection -Text 'Allow permanent eligible assignments' -X 12 -Y 58 -Checked $false -Width 400
+$ActivePolicySection = New-Object System.Windows.Forms.GroupBox
+$ActivePolicySection.Text = 'Active Assignments'
+$ActivePolicySection.Font = New-Object System.Drawing.Font($Script:MainForm.Font.FontFamily, $Script:MainForm.Font.Size, [System.Drawing.FontStyle]::Bold)
+$ActivePolicySection.ForeColor = [System.Drawing.Color]::DarkRed
+$ActivePolicySection.Location = New-Object System.Drawing.Point(456, 62)
+$ActivePolicySection.Size = New-Object System.Drawing.Size(462, 154)
+$Script:PimGroupBox.Controls.Add($ActivePolicySection)
+$ActivePolicyNote = Add-UiLabel -Parent $ActivePolicySection -Text 'permanent assignments allow always-active access' -X 145 -Y 0 -Width 305 -Height 18
+$ActivePolicyNote.Font = New-Object System.Drawing.Font($Script:MainForm.Font.FontFamily, ($Script:MainForm.Font.Size - 1), [System.Drawing.FontStyle]::Regular)
+$ActivePolicyNote.ForeColor = $Script:PimGroupBox.ForeColor
+$ActivePolicyBody = New-Object System.Windows.Forms.Panel
+$ActivePolicyBody.Location = New-Object System.Drawing.Point(6, 20)
+$ActivePolicyBody.Size = New-Object System.Drawing.Size(450, 128)
+$ActivePolicyBody.Anchor = 'Top, Bottom, Left, Right'
+$ActivePolicyBody.BackColor = [System.Drawing.Color]::FromArgb(255, 242, 242)
+$ActivePolicyBody.Font = $Script:MainForm.Font
+$ActivePolicyBody.ForeColor = $Script:PimGroupBox.ForeColor
+$ActivePolicySection.Controls.Add($ActivePolicyBody)
+[void](Add-UiLabel -Parent $ActivePolicyBody -Text 'Expiry days (blank keeps current default)' -X 6 -Y 6 -Width 285)
+$Script:ActiveAssignmentDaysBox = Add-UiTextBox -Parent $ActivePolicyBody -X 304 -Y 6 -Width 90
+$Script:AllowPermanentActiveBox = Add-UiCheckBox -Parent $ActivePolicyBody -Text 'Allow permanent active assignments (NOT RECOMMENDED)' -X 6 -Y 38 -Checked $false -Width 438
+$Script:AllowPermanentActiveBox.ForeColor = [System.Drawing.Color]::DarkRed
+$Script:RequireMfaActiveBox = Add-UiCheckBox -Parent $ActivePolicyBody -Text 'Require MFA on active assignment' -X 6 -Y 70 -Checked $true -Width 438
+$Script:RequireJustificationActiveBox = Add-UiCheckBox -Parent $ActivePolicyBody -Text 'Require justification on active assignment' -X 6 -Y 100 -Checked $true -Width 438
+
+$Script:EligibleMembersLabel = Add-UiLabel -Parent $CreateTab -Text "Eligible member UPNs (optional)`r`nSeparate with commas, semicolons, or new lines." -X 18 -Y 518 -Width 330 -Height 50
+$Script:EligibleMembersBox = Add-UiTextBox -Parent $CreateTab -X 350 -Y 518 -Width 600 -Height 50 -Multiline $true
+$CreateHint = Add-UiLabel -Parent $CreateTab -Text 'This assigns listed users as PIM-eligible members, not active members. Entra role assignment to the group is a separate step.' -X 18 -Y 574 -Width 745 -Height 42
 $CreateHint.ForeColor = [System.Drawing.Color]::DimGray
 $CreateButton = New-Object System.Windows.Forms.Button
 $CreateButton.Text = 'Create group'
-$CreateButton.Location = New-Object System.Drawing.Point(780, 544)
+$CreateButton.Location = New-Object System.Drawing.Point(780, 574)
 $CreateButton.Size = New-Object System.Drawing.Size(170, 34)
 $CreateTab.Controls.Add($CreateButton)
  
@@ -2486,35 +3132,81 @@ $BulkTab.Controls.Add($Script:BulkCreateButton)
 # ==================================================
 
 $ReportTab = New-Object System.Windows.Forms.TabPage
-$ReportTab.Text = 'Assignment reports'
+$ReportTab.Text = 'Assignments'
 $ReportTab.BackColor = [System.Drawing.Color]::White
 $Script:TabControl.TabPages.Add($ReportTab)
-[void](Add-UiLabel -Parent $ReportTab -Text 'Group name or ID' -X 18 -Y 20 -Width 140)
-$Script:ReportGroupBox = Add-UiTextBox -Parent $ReportTab -X 155 -Y 18 -Width 310
+$ReportLayout = New-Object System.Windows.Forms.TableLayoutPanel
+$ReportLayout.Dock = [System.Windows.Forms.DockStyle]::Fill
+$ReportLayout.ColumnCount = 1
+$ReportLayout.RowCount = 4
+[void]$ReportLayout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+foreach ($Height in @(218, 28))
+{
+    [void]$ReportLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, $Height)))
+}
+[void]$ReportLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+[void]$ReportLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 52)))
+$ReportLayout.Add_SizeChanged({
+    param($Sender, $EventArgs)
+    $Sender.RowStyles[0].Height = [Math]::Min(218, [Math]::Max(100, $Sender.ClientSize.Height - 180))
+})
+$ReportTab.Controls.Add($ReportLayout)
+$ReportHeader = New-Object System.Windows.Forms.Panel
+$ReportHeader.Dock = [System.Windows.Forms.DockStyle]::Fill
+$ReportHeader.Margin = New-Object System.Windows.Forms.Padding(0)
+$ReportHeader.AutoScroll = $true
+$ReportHeader.AutoScrollMinSize = New-Object System.Drawing.Size(970, 210)
+$ReportLayout.Controls.Add($ReportHeader, 0, 0)
+$SingleGroupSection = New-Object System.Windows.Forms.GroupBox
+$SingleGroupSection.Text = 'One group'
+$SingleGroupSection.Location = New-Object System.Drawing.Point(18, 10)
+$SingleGroupSection.Size = New-Object System.Drawing.Size(940, 110)
+$ReportHeader.Controls.Add($SingleGroupSection)
+[void](Add-UiLabel -Parent $SingleGroupSection -Text 'Group Name or ID' -X 12 -Y 29 -Width 128)
+$Script:ReportGroupBox = Add-UiTextBox -Parent $SingleGroupSection -X 150 -Y 27 -Width 280
+$Script:ReportGroupBox.BackColor = [System.Drawing.Color]::WhiteSmoke
 $ReportOneButton = New-Object System.Windows.Forms.Button
 $ReportOneButton.Text = 'Query one group'
-$ReportOneButton.Location = New-Object System.Drawing.Point(480, 15)
+$ReportOneButton.Location = New-Object System.Drawing.Point(445, 24)
 $ReportOneButton.Size = New-Object System.Drawing.Size(150, 32)
-$ReportTab.Controls.Add($ReportOneButton)
+$SingleGroupSection.Controls.Add($ReportOneButton)
+$AddEligibleButton = New-Object System.Windows.Forms.Button
+$AddEligibleButton.Text = 'Add eligible members'
+$AddEligibleButton.Location = New-Object System.Drawing.Point(605, 24)
+$AddEligibleButton.Size = New-Object System.Drawing.Size(180, 32)
+$SingleGroupSection.Controls.Add($AddEligibleButton)
+$RemoveMembersButton = New-Object System.Windows.Forms.Button
+$RemoveMembersButton.Text = 'Remove members'
+$RemoveMembersButton.Location = New-Object System.Drawing.Point(795, 24)
+$RemoveMembersButton.Size = New-Object System.Drawing.Size(135, 32)
+$SingleGroupSection.Controls.Add($RemoveMembersButton)
+$SingleGroupHint = Add-UiLabel -Parent $SingleGroupSection -Text 'Query is read-only. Add/remove changes access; review the group, users and changes before confirming.' -X 12 -Y 68 -Width 900 -Height 30
+$SingleGroupHint.ForeColor = [System.Drawing.Color]::DimGray
+$AllGroupsSection = New-Object System.Windows.Forms.GroupBox
+$AllGroupsSection.Text = 'All groups (read-only)'
+$AllGroupsSection.Location = New-Object System.Drawing.Point(18, 128)
+$AllGroupsSection.Size = New-Object System.Drawing.Size(940, 65)
+$ReportHeader.Controls.Add($AllGroupsSection)
 $ReportAllButton = New-Object System.Windows.Forms.Button
 $ReportAllButton.Text = 'Query all eligible'
-$ReportAllButton.Location = New-Object System.Drawing.Point(640, 15)
+$ReportAllButton.Location = New-Object System.Drawing.Point(12, 24)
 $ReportAllButton.Size = New-Object System.Drawing.Size(150, 32)
-$ReportTab.Controls.Add($ReportAllButton)
+$AllGroupsSection.Controls.Add($ReportAllButton)
 $ReportPermanentButton = New-Object System.Windows.Forms.Button
 $ReportPermanentButton.Text = 'Scan permanent active'
-$ReportPermanentButton.Location = New-Object System.Drawing.Point(800, 15)
+$ReportPermanentButton.Location = New-Object System.Drawing.Point(172, 24)
 $ReportPermanentButton.Size = New-Object System.Drawing.Size(165, 32)
-$ReportTab.Controls.Add($ReportPermanentButton)
-$ReportTab.AutoScroll = $true
-$ReportTab.AutoScrollMinSize = New-Object System.Drawing.Size(970, 580)
-$ReportHint = Add-UiLabel -Parent $ReportTab -Text 'Scans include role-assignable groups. Direct members require verification, including members with temporary PIM access. This report does not change access.' -X 18 -Y 58 -Width 940 -Height 40
+$AllGroupsSection.Controls.Add($ReportPermanentButton)
+$ReportHint = Add-UiLabel -Parent $AllGroupsSection -Text 'Scans include role-assignable groups. Verify direct members, including temporary PIM access.' -X 350 -Y 24 -Width 575 -Height 32
 $ReportHint.ForeColor = [System.Drawing.Color]::DimGray
-$Script:ReportStatus = Add-UiLabel -Parent $ReportTab -Text 'No report run.' -X 18 -Y 104 -Width 930 -Height 28
+$Script:ReportStatus = Add-UiLabel -Parent $ReportTab -Text 'No report run.' -X 18 -Y 202 -Width 930 -Height 28
+$Script:ReportStatus.Dock = [System.Windows.Forms.DockStyle]::Fill
+$Script:ReportStatus.Margin = New-Object System.Windows.Forms.Padding(18, 0, 18, 0)
+$Script:ReportStatus.AutoEllipsis = $true
+$ReportLayout.Controls.Add($Script:ReportStatus, 0, 1)
 $Script:ReportGrid = New-Object System.Windows.Forms.DataGridView
-$Script:ReportGrid.Location = New-Object System.Drawing.Point(18, 138)
-$Script:ReportGrid.Size = New-Object System.Drawing.Size(940, 390)
-$Script:ReportGrid.Anchor = 'Top, Bottom, Left, Right'
+$Script:ReportGrid.Dock = [System.Windows.Forms.DockStyle]::Fill
+$Script:ReportGrid.Margin = New-Object System.Windows.Forms.Padding(18, 0, 18, 0)
 $Script:ReportGrid.ReadOnly = $true
 $Script:ReportGrid.AllowUserToAddRows = $false
 $Script:ReportGrid.AllowUserToDeleteRows = $false
@@ -2528,14 +3220,20 @@ foreach ($Column in @('GroupName', 'GroupId', 'Finding', 'Access', 'PrincipalNam
 {
     [void]$Script:ReportGrid.Columns.Add($Column, $Column)
 }
-$ReportTab.Controls.Add($Script:ReportGrid)
+$ReportLayout.Controls.Add($Script:ReportGrid, 0, 2)
+$ReportFooter = New-Object System.Windows.Forms.FlowLayoutPanel
+$ReportFooter.Dock = [System.Windows.Forms.DockStyle]::Fill
+$ReportFooter.Margin = New-Object System.Windows.Forms.Padding(0)
+$ReportFooter.Padding = New-Object System.Windows.Forms.Padding(18, 8, 18, 8)
+$ReportFooter.FlowDirection = [System.Windows.Forms.FlowDirection]::RightToLeft
+$ReportFooter.WrapContents = $false
+$ReportLayout.Controls.Add($ReportFooter, 0, 3)
 $Script:ReportExportButton = New-Object System.Windows.Forms.Button
 $Script:ReportExportButton.Text = 'Export results'
-$Script:ReportExportButton.Location = New-Object System.Drawing.Point(755, 545)
 $Script:ReportExportButton.Size = New-Object System.Drawing.Size(200, 36)
-$Script:ReportExportButton.Anchor = 'Bottom, Right'
+$Script:ReportExportButton.Margin = New-Object System.Windows.Forms.Padding(0)
 $Script:ReportExportButton.Enabled = $false
-$ReportTab.Controls.Add($Script:ReportExportButton)
+$ReportFooter.Controls.Add($Script:ReportExportButton)
 
 # ==================================================
 # ^^^^^ Assignment Reports Tab ^^^^^
@@ -2569,11 +3267,13 @@ $Script:LogBox.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
 $Script:LogBox.BackColor = [System.Drawing.Color]::White
 $Script:MainForm.Controls.Add($Script:LogBox)
  
-foreach ($Button in @($CheckConnectionButton, $DisconnectButton, $Script:ApplyExistingButton, $TemplateButton, $ImportBulkButton, $Script:AuditBrowseButton, $HelpButton, $ReportOneButton, $ReportAllButton, $ReportPermanentButton, $Script:ReportExportButton))
+foreach ($Button in @($CheckConnectionButton, $DisconnectButton, $Script:ApplyExistingButton, $TemplateButton, $ImportBulkButton, $Script:AuditBrowseButton, $HelpButton, $ReportOneButton, $ReportAllButton, $ReportPermanentButton, $Script:ReportExportButton, $RemoveMembersButton))
 {
     Set-UiButtonStyle -Button $Button
 }
-foreach ($Button in @($ConnectButton, $CreateButton, $Script:BulkCreateButton))
+$RemoveMembersButton.ForeColor = [System.Drawing.Color]::DarkRed
+$RemoveMembersButton.FlatAppearance.BorderColor = [System.Drawing.Color]::IndianRed
+foreach ($Button in @($ConnectButton, $CreateButton, $Script:BulkCreateButton, $AddEligibleButton))
 {
     Set-UiButtonStyle -Button $Button -Primary $true
 }
@@ -2846,9 +3546,29 @@ $Script:BulkCreateButton.Add_Click({ Invoke-BulkCreate })
 # ^^^^^ Bulk Creation Events ^^^^^
 # ==================================================
 
+# ==================================================
+# MARK: Assignment Events
+# ==================================================
+
 $ReportOneButton.Add_Click({ Invoke-AssignmentReport -Mode 'OneEligible' })
 $ReportAllButton.Add_Click({ Invoke-AssignmentReport -Mode 'AllEligible' })
 $ReportPermanentButton.Add_Click({ Invoke-AssignmentReport -Mode 'Permanent' })
+$AddEligibleButton.Add_Click({
+    try { Show-AddEligibleMembers }
+    catch
+    {
+        Write-UiLog "Eligible assignment preparation failed: $($_.Exception.Message)"
+        Show-Message -Message $_.Exception.Message -Title 'Eligible assignment failed' -Icon Error
+    }
+})
+$RemoveMembersButton.Add_Click({
+    try { Show-RemoveMembers }
+    catch
+    {
+        Write-UiLog "Member removal preparation failed: $($_.Exception.Message)"
+        Show-Message -Message $_.Exception.Message -Title 'Member removal failed' -Icon Error
+    }
+})
 $Script:ReportExportButton.Add_Click({
     try { Export-AssignmentReport }
     catch
@@ -2857,6 +3577,10 @@ $Script:ReportExportButton.Add_Click({
         Show-Message -Message $_.Exception.Message -Title 'Export failed' -Icon Error
     }
 })
+
+# ==================================================
+# ^^^^^ Assignment Events ^^^^^
+# ==================================================
  
 # ==================================================
 # MARK: Initialize and Display the GUI
@@ -2864,6 +3588,9 @@ $Script:ReportExportButton.Add_Click({
  
 Update-GroupTypeVisibility
 $Script:MainForm.Add_Shown({
+    $Script:MainForm.BringToFront()
+    [void]$Script:MainForm.Activate()
+    $Script:MainForm.TopMost = $false
     Write-UiLog "Session started. Audit file: $($Script:AuditPath)"
     try
     {
@@ -2881,6 +3608,14 @@ $Script:MainForm.Add_Shown({
     }
 })
 $Script:MainForm.Add_FormClosed({ Write-UiLog 'Session closed.' })
+$Script:MainForm.Add_FormClosing({
+    param($Sender, $EventArgs)
+    if ($Sender.UseWaitCursor -or -not $ConnectButton.Enabled)
+    {
+        $EventArgs.Cancel = $true
+        Write-UiLog 'Close blocked: wait for the current operation to finish before closing PIM Group Manager.'
+    }
+})
  
 $WorkingArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
 $Script:MainForm.Size = New-Object System.Drawing.Size(
@@ -2892,3 +3627,23 @@ $Script:MainForm.Size = New-Object System.Drawing.Size(
 # ==================================================
 # ^^^^^ Initialize and Display the GUI ^^^^^
 # ==================================================
+}
+finally
+{
+    try
+    {
+        if ($Script:HelpWindow -and -not $Script:HelpWindow.IsDisposed)
+        {
+            $Script:HelpWindow.Dispose()
+        }
+        if ($Script:MainForm -and -not $Script:MainForm.IsDisposed)
+        {
+            $Script:MainForm.Dispose()
+        }
+    }
+    finally
+    {
+        $InstanceGuard.Dispose()
+    }
+}
+}

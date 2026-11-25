@@ -15,9 +15,11 @@ The tool can create:
  
 For PIM-enabled groups, the tool can also configure the group's **PIM Member policy** and optionally assign users as **eligible members**.
 
-The **Assignment reports** tab provides read-only eligibility and active-membership scans with optional Excel or CSV export.
+The **Assignments** tab groups **Query one group**, **Add eligible members**, and **Remove members** under **One group**. **All groups (read-only)** contains **Query all eligible** and **Scan permanent active**. Queries are read-only; adding or removing members changes access.
  
 The window automatically adjusts to the available screen size. If all options cannot be displayed at once, scroll through the group configuration section. The activity log remains available at the bottom of the window.
+
+Larger, bold tabs highlight the selected tab in blue. Assignment results resize with the window; **Export results** remains in a separate footer, and the group-action sections scroll when needed.
  
 ---
  
@@ -63,6 +65,8 @@ The requested permissions are:
 - `RoleManagementPolicy.ReadWrite.AzureADGroup`
 - `PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup`
 - `PrivilegedAssignmentSchedule.Read.AzureADGroup` (permanent-active scan)
+
+Member removal requests additional permissions only when needed: `PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup` for PIM active schedules, and `RoleManagement.ReadWrite.Directory` for direct membership removal from role-assignable groups. The tool asks before reconnecting for these permissions.
  
 Depending on your organization's Microsoft Entra configuration, administrator consent may be required before these permissions can be used.
  
@@ -85,6 +89,14 @@ powershell.exe -STA -NoProfile -File ".\PIM-Group-Manager.ps1"
 ```
  
 The `-STA` option is required for the graphical interface.
+
+The GUI comes to the front on launch, then behaves like a normal window; it does not remain always-on-top.
+
+Only one instance can run per user in a Windows session, including launches from another PowerShell process or another copy of the script. A duplicate launch warns in the console and stops before resetting any GUI state. In the same PowerShell host, it also attempts to restore and activate the existing window.
+
+In VS Code, selecting the **entire script** and pressing **F8** is supported; do not run only selected internal sections, which bypass startup checks. Prefer the command above in a separate PowerShell process to keep the VS Code PowerShell session available while the GUI is open. VS Code may queue F8 requests while the GUI occupies its PowerShell session; a queued request that runs after the window closes is a new launch, not a simultaneous duplicate.
+
+Closing is blocked during sign-in and long-running operations. Wait for completion and review the activity log before closing. Normal closure or a startup error releases the single-instance guard and disposes the windows so the tool can be launched again. This does not roll back Graph changes or automatically disconnect Graph.
  
 Select **How to use** in the main window header to open the instructions in a separate window. The help window closes with the main application.
 
@@ -115,14 +127,14 @@ When you are finished using the tool, select **Disconnect**.
  
 ---
 
-## Assignment reports
+## Assignments
 
-Connect to Microsoft Graph and open **Assignment reports**:
+Connect to Microsoft Graph and open **Assignments**:
 
-1. Enter an exact group display name or object ID and select **Query one group** to see current eligible member and owner assignments. The group must be a cloud-only, role-assignable security group with assigned membership. Use the object ID if names are duplicated.
-2. Select **Query all eligible** to find current eligible assignments across role-assignable groups.
+1. Under **One group**, enter an exact group display name or object ID and select **Query one group** to see current eligible member and owner assignments. The group must be a cloud-only, role-assignable security group with assigned membership. Use the object ID if names are duplicated.
+2. Under **All groups (read-only)**, select **Query all eligible** to find current eligible assignments across role-assignable groups.
 3. Select **Scan permanent active** to find permanent PIM active member assignments and review direct members.
-4. Review the table and select **Export results** to save findings. Excel (`.xlsx`) is the default when ImportExcel is installed; otherwise CSV is the default. Choose either format in the save dialog. The suggested filename begins with `YYYY-MM-DD_HHmm-`. Values that could be interpreted as spreadsheet formulas are prefixed with an apostrophe in both formats.
+4. Review the table and select **Export results** to save findings. Excel (`.xlsx`) is the default when ImportExcel is installed; otherwise CSV is the default. Choose either format in the save dialog. Excel reports and bulk templates use table style **Light20**. The suggested filename begins with `YYYY-MM-DD_HHmm-`. Values that could be interpreted as spreadsheet formulas are prefixed with an apostrophe in both formats.
 
 The all-groups eligible report omits PrincipalId and PrincipalType from both the table and export. Names or UPNs may be blank when Graph does not return them; query the group individually to see the principal ID.
 
@@ -133,6 +145,28 @@ The permanent-active report covers membership, not ownership. **Permanent PIM ac
 The permanent scan requires the delegated `PrivilegedAssignmentSchedule.Read.AzureADGroup` permission (or its ReadWrite equivalent) and a suitable Entra role, such as directory-scoped Global Reader or Privileged Role Administrator for role-assignable groups. If the permission is missing, the scan offers to reconnect and request consent; an administrator may need to grant it. Other existing operations do not require this additional scope. Reports and exports contain potentially sensitive directory data; store and share them appropriately.
 
 Run the offline, mocked report tests with `powershell.exe -NoProfile -File .\tests\AssignmentReports.Tests.ps1`.
+
+### Add eligible members
+
+Under **One group** in the main Assignments tab, enter an exact group name or object ID before selecting **Add eligible members**. The popup displays that group as bold, non-editable text; cancel and change the main field to choose another group. Enter one or more user UPNs in the popup separated by commas, semicolons, or new lines. Duplicate group names require the object ID. Cloud-only security and Microsoft 365 groups with assigned membership are supported, including non-role-assignable groups; dynamic and on-premises synchronized groups are not.
+
+The start defaults to **Start now** and the end defaults to 365 days from opening the dialog. Uncheck **Start now** to choose a future start, edit the end, or choose permanent eligibility. The date and time controls use the workstation's local time zone and are converted to UTC. The existing group PIM policy may reject the selected duration or permanent eligibility.
+
+Review the resolved group, users, and schedule before confirming. Submitting a request can onboard a group to PIM if it is not already managed; onboarding cannot be undone. This creates eligible membership, not active group membership, and does not change the group's policy. Requests are submitted one at a time: if one fails, later users are not attempted. The message identifies accepted, failed or uncertain, and unattempted users. Check Entra PIM before retrying and verify provisioning status after submission.
+
+This action uses the existing `PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup` delegated scope and requires an appropriate directory role or group ownership. Microsoft documents [supported roles and permissions](https://learn.microsoft.com/en-us/graph/api/privilegedaccessgroup-post-eligibilityschedulerequests?view=graph-rest-1.0).
+
+### Remove members
+
+Under **One group**, enter the exact group name or ID in the main window before selecting **Remove members**. The popup displays that group as bold, non-editable text; cancel and change the main field to choose another group. Enter one or more user UPNs, then select the categories to remove: PIM active schedules, PIM eligible schedules, and/or the direct group members relationship. None is selected by default. Supported groups and UPN separators are the same as for adding eligible members. Owners and indirect or nested membership are not removed.
+
+Review the resolved group, requested users, selected categories, and matching operations before confirming. PIM schedule results can include future assignments. If multiple schedules of the same kind match one user, or a schedule is pending or cannot be classified, the tool stops without changing access; review it in Entra. The preview is a point-in-time view and can change before submission.
+
+**These categories can overlap:** a PIM active assignment or activation also appears in the group's direct members. Removing either can affect active access; deleting the group relationship is not limited to memberships originally added through the groups API. Removing eligibility may not end an existing activation, and users may retain access through other paths. When several categories are selected, one operation can change another operation's target and cause a later operation to fail.
+
+Changes are submitted sequentially and stop on the first error. The outcome identifies accepted requests, the failed or uncertain operation, and operations not attempted. PIM requests can be pending even when accepted; always verify PIM status and group membership in Entra before retrying or assuming access has been removed. The local audit log records each operation.
+
+PIM active removal requires delegated `PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup`; eligible removal uses the existing `PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup`. Removing the direct group relationship uses `Group.ReadWrite.All`, plus `RoleManagement.ReadWrite.Directory` for role-assignable groups. Appropriate Entra roles are also required; a Privileged Role Administrator is the least-privileged supported role for removing members from role-assignable groups. See Microsoft's documentation for [PIM active requests](https://learn.microsoft.com/en-us/graph/api/privilegedaccessgroup-post-assignmentschedulerequests?view=graph-rest-1.0), [eligible requests](https://learn.microsoft.com/en-us/graph/api/privilegedaccessgroup-post-eligibilityschedulerequests?view=graph-rest-1.0), and [group member removal](https://learn.microsoft.com/en-us/graph/api/group-delete-members?view=graph-rest-1.0).
 
 ---
  
@@ -232,6 +266,8 @@ Then enter the Microsoft Entra dynamic membership rule.
 ### 4. Review PIM Settings
  
 This section applies only to **PIM-enabled security (role-assignable)** groups.
+
+The policy settings separate **Eligible assignments** from **Active assignments**. The Active section is lightly tinted red, and permanent active assignments are marked **NOT RECOMMENDED** because they allow ongoing access without PIM activation. These are policy settings, not a request to add active members; the optional UPN list below still creates eligible assignments only.
  
 The default PIM Member settings are:
  
@@ -249,12 +285,13 @@ If **Active Assignment Days** is left blank, the tool keeps the maximum duration
  
 You can optionally specify users who should be eligible to activate membership in the group through PIM.
  
-Enter each user's UPN and separate multiple users with semicolons.
+Enter each user's UPN and separate multiple users with commas, semicolons, or new lines, just like the Add/Remove members popups.
  
 Example:
  
 ```text
-user1@contoso.com;user2@contoso.com;user3@contoso.com
+user1@contoso.com;user2@contoso.com,
+user3@contoso.com
 ```
  
 These users are added as **PIM-eligible members**.
