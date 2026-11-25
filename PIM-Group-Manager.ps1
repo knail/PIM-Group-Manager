@@ -44,7 +44,8 @@
       for creating role-assignable groups and managing their PIM settings.
     - Delegated consent for User.Read, User.Read.All, Group.ReadWrite.All,
       RoleManagementPolicy.ReadWrite.AzureADGroup, and
-      PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup.
+      PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup. The reports also
+      request PrivilegedAssignmentSchedule.Read.AzureADGroup.
  
     Install modules in the PowerShell environment used to launch the GUI:
         Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
@@ -141,7 +142,7 @@ PREREQUISITES
 
 - Creating role-assignable groups and changing their PIM settings generally requires Privileged Role Administrator or equivalent permissions.
 
-- Delegated Graph scopes requested: User.Read, User.Read.All, Group.ReadWrite.All, RoleManagementPolicy.ReadWrite.AzureADGroup, and PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup.
+- Delegated Graph scopes requested: User.Read, User.Read.All, Group.ReadWrite.All, RoleManagementPolicy.ReadWrite.AzureADGroup, PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup, and PrivilegedAssignmentSchedule.Read.AzureADGroup (for active-access reports).
 
 CONNECTION
 
@@ -205,6 +206,16 @@ BULK GROUPS
 
 6. Review the results CSV saved beside the bulk input.
 
+ASSIGNMENT REPORTS
+
+1. Connect to Graph, then open Assignment reports. For one group, enter its exact display name or object ID and select Query one group.
+
+2. Select Query all eligible to scan all role-assignable groups for current eligible members and owners. Select Scan permanent active to inspect active member assignments and direct members.
+
+3. Review the results and optionally export them to CSV. Results contain directory information; protect the exported file.
+
+- Role-assignable groups are included even if not onboarded to PIM. Other groups are not included. Direct members are candidates, not proof of permanence; verify in Entra. A member with a temporary PIM assignment may also have separate direct access.
+
 IMPORTANT
 
 - A role-assignable group must be a security group with assigned (not dynamic) membership. Entra does not allow dynamic membership for role-assignable groups.
@@ -266,6 +277,8 @@ $Script:GraphScopes = @(
     'RoleManagementPolicy.ReadWrite.AzureADGroup'
     'PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup'
 )
+$Script:ReportScope = 'PrivilegedAssignmentSchedule.Read.AzureADGroup'
+$Script:ReportRows = @()
 $Script:BulkRows = @()
 $Script:BulkPath = ''
 $Script:ConnectionStatusLabel = $null
@@ -707,7 +720,7 @@ function Connect-ToGraph
     }
  
     Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
-    Connect-MgGraph -Scopes $Script:GraphScopes -ContextScope Process -ErrorAction Stop
+    Connect-MgGraph -Scopes ($Script:GraphScopes + $Script:ReportScope) -ContextScope Process -ErrorAction Stop
     Test-GraphConnection
 }
  
@@ -1325,6 +1338,236 @@ function Add-PimEligibleMember
 # ^^^^^ PIM Eligible Member Assignments ^^^^^
 # ==================================================
  
+# ==================================================
+# MARK: Read-only Assignment Reports
+# ==================================================
+
+function Get-GraphCollection
+{
+    param([Parameter(Mandatory = $true)][string]$Uri)
+
+    $Seen = @{}
+    while ($Uri)
+    {
+        $ParsedUri = [uri]$Uri
+        if ($ParsedUri.Scheme -ne 'https' -or $ParsedUri.Host -ne 'graph.microsoft.com' -or
+            -not $ParsedUri.IsDefaultPort -or $Seen.ContainsKey($Uri))
+        {
+            throw "Invalid or repeated Graph pagination URL: $Uri"
+        }
+        $Seen[$Uri] = $true
+        $Response = Invoke-PimGraphRequest -Method GET -Uri $Uri
+        if ($Response -isnot [System.Collections.IDictionary] -or -not $Response.Contains('value') -or $null -eq $Response.value)
+        {
+            throw "Graph returned an invalid collection for $Uri."
+        }
+        foreach ($Item in $Response.value) { $Item }
+        $Uri = [string]$Response.'@odata.nextLink'
+    }
+}
+
+function Get-ReportGroups
+{
+    $Uri = 'https://graph.microsoft.com/v1.0/groups?$filter=isAssignableToRole%20eq%20true&$select=id,displayName,isAssignableToRole'
+    foreach ($Group in @(Get-GraphCollection -Uri $Uri))
+    {
+        $GroupId = [guid]::Empty
+        if (-not [guid]::TryParse([string]$Group.id, [ref]$GroupId) -or
+            [string]::IsNullOrWhiteSpace($Group.displayName) -or $Group.isAssignableToRole -ne $true)
+        {
+            throw 'Graph returned a role-assignable group without a valid ID, name, or role-assignable flag.'
+        }
+        $Group
+    }
+}
+
+function Get-GroupReportInstances
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$GroupId,
+        [Parameter(Mandatory = $true)][ValidateSet('eligibilityScheduleInstances', 'assignmentScheduleInstances')][string]$Kind
+    )
+    $ParsedId = [guid]::Empty
+    if (-not [guid]::TryParse($GroupId, [ref]$ParsedId)) { throw "Invalid group ID: $GroupId" }
+    $Filter = [uri]::EscapeDataString("groupId eq '$ParsedId'")
+    $Uri = "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/${Kind}?`$filter=$Filter&`$expand=principal"
+    Get-GraphCollection -Uri $Uri
+}
+
+function Test-CurrentReportInstance
+{
+    param([Parameter(Mandatory = $true)]$Instance, [Parameter(Mandatory = $true)][datetimeoffset]$Now)
+    if ($Instance -isnot [System.Collections.IDictionary] -or -not $Instance.principalId -or -not $Instance.accessId -or
+        -not $Instance.Contains('startDateTime') -or -not $Instance.Contains('endDateTime'))
+    {
+        throw 'Graph returned an assignment instance without its principal, access type, start, or end date.'
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Instance.startDateTime) -and
+        [datetimeoffset]::Parse([string]$Instance.startDateTime) -gt $Now) { return $false }
+    if ($null -ne $Instance.endDateTime -and [string]$Instance.endDateTime -ne '')
+    {
+        return ([datetimeoffset]::Parse([string]$Instance.endDateTime) -gt $Now)
+    }
+    return $true
+}
+
+function New-AssignmentReportRow
+{
+    param($Group, [string]$Type, [string]$Access, [string]$PrincipalId, $Principal, $Start, $End)
+    [PSCustomObject][ordered]@{
+        GroupName = [string]$Group.displayName
+        GroupId = [string]$Group.id
+        Finding = $Type
+        Access = $Access
+        PrincipalName = [string]$Principal.displayName
+        UserPrincipalName = [string]$Principal.userPrincipalName
+        PrincipalId = $PrincipalId
+        PrincipalType = [string]$Principal.'@odata.type'
+        StartUtc = [string]$Start
+        EndUtc = [string]$End
+    }
+}
+
+function Get-EligibleReportRows
+{
+    param($Group, [datetimeoffset]$Now)
+    foreach ($Instance in @(Get-GroupReportInstances -GroupId $Group.id -Kind 'eligibilityScheduleInstances'))
+    {
+        if (Test-CurrentReportInstance -Instance $Instance -Now $Now)
+        {
+            New-AssignmentReportRow -Group $Group -Type 'Eligible' -Access $Instance.accessId `
+                -PrincipalId $Instance.principalId -Principal $Instance.principal -Start $Instance.startDateTime -End $Instance.endDateTime
+        }
+    }
+}
+
+function Get-PermanentReportRows
+{
+    param($Group, [datetimeoffset]$Now)
+    $ActivePrincipals = @{}
+    foreach ($Instance in @(Get-GroupReportInstances -GroupId $Group.id -Kind 'assignmentScheduleInstances'))
+    {
+        if (-not (Test-CurrentReportInstance -Instance $Instance -Now $Now) -or $Instance.accessId -ne 'member') { continue }
+        if ($Instance.assignmentType -notin @('assigned', 'activated'))
+        {
+            throw "Unknown PIM assignment type '$($Instance.assignmentType)' for group $($Group.id); cannot classify direct members safely."
+        }
+        if ($Instance.assignmentType -eq 'assigned' -and [string]::IsNullOrWhiteSpace([string]$Instance.endDateTime))
+        {
+            $ActivePrincipals[[string]$Instance.principalId] = 'Permanent'
+            New-AssignmentReportRow -Group $Group -Type 'Permanent PIM active' -Access 'member' `
+                -PrincipalId $Instance.principalId -Principal $Instance.principal -Start $Instance.startDateTime -End $null
+        }
+        elseif (-not $ActivePrincipals.ContainsKey([string]$Instance.principalId))
+        {
+            $ActivePrincipals[[string]$Instance.principalId] = 'Temporary'
+        }
+    }
+
+    # Graph v1.0 omits service principals from this collection; Microsoft documents beta as a workaround.
+    $Uri = "https://graph.microsoft.com/beta/groups/$($Group.id)/members"
+    foreach ($Member in @(Get-GraphCollection -Uri $Uri))
+    {
+        if ([string]::IsNullOrWhiteSpace([string]$Member.id)) { throw "Graph returned a member without an ID for group $($Group.id)." }
+        $Classification = $ActivePrincipals[[string]$Member.id]
+        if ($Classification -ne 'Permanent')
+        {
+            $Finding = if ($Classification -eq 'Temporary') { 'Direct member / temporary PIM - verify' } else { 'Direct member - verify permanence' }
+            New-AssignmentReportRow -Group $Group -Type $Finding -Access 'member' `
+                -PrincipalId $Member.id -Principal $Member -Start $null -End $null
+        }
+    }
+}
+
+function Invoke-AssignmentReport
+{
+    param([ValidateSet('OneEligible', 'AllEligible', 'Permanent')][string]$Mode)
+    $Script:ReportRows = @()
+    $Script:ReportGrid.Rows.Clear()
+    $Script:ReportStatus.Text = 'Scanning...'
+    $Script:ReportExportButton.Enabled = $false
+    try
+    {
+        Assert-GraphReady
+        if ($Mode -eq 'Permanent' -and (Get-GraphContext).Scopes -notcontains $Script:ReportScope)
+        {
+            throw "Reconnect to Microsoft Graph and consent to $($Script:ReportScope) for the permanent-access scan."
+        }
+        $Script:TabControl.Enabled = $false
+        $Script:AuditBrowseButton.Enabled = $false
+        $Script:MainForm.UseWaitCursor = $true
+        [System.Windows.Forms.Application]::DoEvents()
+        $Groups = if ($Mode -eq 'OneEligible') { @(Get-ExistingPimGroup -GroupNameOrId $Script:ReportGroupBox.Text) } else { @(Get-ReportGroups) }
+        $Rows = [System.Collections.Generic.List[object]]::new()
+        $Now = [datetimeoffset]::UtcNow
+        $Index = 0
+        foreach ($Group in $Groups)
+        {
+            $Index++
+            $Script:ReportStatus.Text = "Scanning group $Index of $($Groups.Count): $($Group.displayName)"
+            $Script:ReportStatus.Refresh()
+            Write-UiLog "Assignment report ${Mode}: scanning $Index of $($Groups.Count): '$($Group.displayName)' [$($Group.id)]."
+            $Findings = if ($Mode -eq 'Permanent') { @(Get-PermanentReportRows -Group $Group -Now $Now) } else { @(Get-EligibleReportRows -Group $Group -Now $Now) }
+            foreach ($Finding in $Findings) { $Rows.Add($Finding) }
+        }
+        $Script:ReportRows = $Rows.ToArray()
+        foreach ($Row in $Script:ReportRows)
+        {
+            [void]$Script:ReportGrid.Rows.Add(@($Row.GroupName, $Row.GroupId, $Row.Finding, $Row.Access, $Row.PrincipalName, $Row.UserPrincipalName, $Row.PrincipalId, $Row.PrincipalType, $Row.StartUtc, $Row.EndUtc))
+        }
+        $Script:ReportStatus.Text = "Completed: $($Groups.Count) group(s), $($Rows.Count) finding(s)."
+        $Script:ReportExportButton.Enabled = $Rows.Count -gt 0
+        Write-UiLog "Assignment report ${Mode} completed: $($Groups.Count) group(s), $($Rows.Count) finding(s)."
+    }
+    catch
+    {
+        $Script:ReportRows = @()
+        $Script:ReportGrid.Rows.Clear()
+        $Script:ReportStatus.Text = 'Scan failed; no results displayed.'
+        Write-UiLog "Assignment report ${Mode} failed: $($_.Exception.Message)"
+        Show-Message -Message "The report could not be completed; no partial results are shown.`r`n`r`n$($_.Exception.Message)" -Title 'Assignment report failed' -Icon Error
+    }
+    finally
+    {
+        $Script:TabControl.Enabled = $true
+        $Script:AuditBrowseButton.Enabled = $true
+        $Script:MainForm.UseWaitCursor = $false
+    }
+}
+
+function Export-AssignmentReport
+{
+    if ($Script:ReportRows.Count -eq 0) { throw 'Run a report with findings before exporting.' }
+    $Dialog = New-Object System.Windows.Forms.SaveFileDialog
+    try
+    {
+        $Dialog.Title = 'Export assignment report'
+        $Dialog.Filter = 'CSV files (*.csv)|*.csv'
+        $Dialog.DefaultExt = 'csv'
+        $Dialog.AddExtension = $true
+        $Dialog.FileName = 'PIM-Assignment-Report.csv'
+        if ($Dialog.ShowDialog($Script:MainForm) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+        $SafeRows = foreach ($Row in $Script:ReportRows)
+        {
+            $Safe = [ordered]@{}
+            foreach ($Property in $Row.PSObject.Properties)
+            {
+                $Value = [string]$Property.Value
+                if ($Value -match '^[\s]*[=+\-@]' -or $Value -match '^[\t\r\n]') { $Value = "'" + $Value }
+                $Safe[$Property.Name] = $Value
+            }
+            [PSCustomObject]$Safe
+        }
+        $SafeRows | Export-Csv -LiteralPath $Dialog.FileName -NoTypeInformation -Encoding UTF8
+        Write-UiLog "Assignment report exported to '$($Dialog.FileName)' ($($Script:ReportRows.Count) findings)."
+    }
+    finally { $Dialog.Dispose() }
+}
+
+# ==================================================
+# ^^^^^ Read-only Assignment Reports ^^^^^
+# ==================================================
+
 # ==================================================
 # MARK: Single Group Workflow and Form Configuration
 # ==================================================
@@ -2165,6 +2408,66 @@ $BulkTab.Controls.Add($Script:BulkCreateButton)
 # ==================================================
  
 # ==================================================
+# MARK: Assignment Reports Tab
+# ==================================================
+
+$ReportTab = New-Object System.Windows.Forms.TabPage
+$ReportTab.Text = 'Assignment reports'
+$ReportTab.BackColor = [System.Drawing.Color]::White
+$Script:TabControl.TabPages.Add($ReportTab)
+[void](Add-UiLabel -Parent $ReportTab -Text 'Group name or ID' -X 18 -Y 20 -Width 140)
+$Script:ReportGroupBox = Add-UiTextBox -Parent $ReportTab -X 155 -Y 18 -Width 310
+$ReportOneButton = New-Object System.Windows.Forms.Button
+$ReportOneButton.Text = 'Query one group'
+$ReportOneButton.Location = New-Object System.Drawing.Point(480, 15)
+$ReportOneButton.Size = New-Object System.Drawing.Size(150, 32)
+$ReportTab.Controls.Add($ReportOneButton)
+$ReportAllButton = New-Object System.Windows.Forms.Button
+$ReportAllButton.Text = 'Query all eligible'
+$ReportAllButton.Location = New-Object System.Drawing.Point(640, 15)
+$ReportAllButton.Size = New-Object System.Drawing.Size(150, 32)
+$ReportTab.Controls.Add($ReportAllButton)
+$ReportPermanentButton = New-Object System.Windows.Forms.Button
+$ReportPermanentButton.Text = 'Scan permanent active'
+$ReportPermanentButton.Location = New-Object System.Drawing.Point(800, 15)
+$ReportPermanentButton.Size = New-Object System.Drawing.Size(165, 32)
+$ReportTab.Controls.Add($ReportPermanentButton)
+$ReportTab.AutoScroll = $true
+$ReportTab.AutoScrollMinSize = New-Object System.Drawing.Size(970, 580)
+$ReportHint = Add-UiLabel -Parent $ReportTab -Text 'Scans include role-assignable groups. Direct members require verification, including members with temporary PIM access. This report does not change access.' -X 18 -Y 58 -Width 940 -Height 40
+$ReportHint.ForeColor = [System.Drawing.Color]::DimGray
+$Script:ReportStatus = Add-UiLabel -Parent $ReportTab -Text 'No report run.' -X 18 -Y 104 -Width 930 -Height 28
+$Script:ReportGrid = New-Object System.Windows.Forms.DataGridView
+$Script:ReportGrid.Location = New-Object System.Drawing.Point(18, 138)
+$Script:ReportGrid.Size = New-Object System.Drawing.Size(940, 390)
+$Script:ReportGrid.Anchor = 'Top, Bottom, Left, Right'
+$Script:ReportGrid.ReadOnly = $true
+$Script:ReportGrid.AllowUserToAddRows = $false
+$Script:ReportGrid.AllowUserToDeleteRows = $false
+$Script:ReportGrid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::DisplayedCells
+$Script:ReportGrid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
+$Script:ReportGrid.RowHeadersVisible = $false
+$Script:ReportGrid.BackgroundColor = [System.Drawing.Color]::White
+$Script:ReportGrid.EnableHeadersVisualStyles = $false
+$Script:ReportGrid.ColumnHeadersDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(231, 237, 246)
+foreach ($Column in @('GroupName', 'GroupId', 'Finding', 'Access', 'PrincipalName', 'UserPrincipalName', 'PrincipalId', 'PrincipalType', 'StartUtc', 'EndUtc'))
+{
+    [void]$Script:ReportGrid.Columns.Add($Column, $Column)
+}
+$ReportTab.Controls.Add($Script:ReportGrid)
+$Script:ReportExportButton = New-Object System.Windows.Forms.Button
+$Script:ReportExportButton.Text = 'Export results to CSV'
+$Script:ReportExportButton.Location = New-Object System.Drawing.Point(755, 545)
+$Script:ReportExportButton.Size = New-Object System.Drawing.Size(200, 36)
+$Script:ReportExportButton.Anchor = 'Bottom, Right'
+$Script:ReportExportButton.Enabled = $false
+$ReportTab.Controls.Add($Script:ReportExportButton)
+
+# ==================================================
+# ^^^^^ Assignment Reports Tab ^^^^^
+# ==================================================
+
+# ==================================================
 # MARK: Activity Log
 # ==================================================
  
@@ -2192,7 +2495,7 @@ $Script:LogBox.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
 $Script:LogBox.BackColor = [System.Drawing.Color]::White
 $Script:MainForm.Controls.Add($Script:LogBox)
  
-foreach ($Button in @($CheckConnectionButton, $DisconnectButton, $Script:ApplyExistingButton, $TemplateButton, $ImportBulkButton, $Script:AuditBrowseButton, $HelpButton))
+foreach ($Button in @($CheckConnectionButton, $DisconnectButton, $Script:ApplyExistingButton, $TemplateButton, $ImportBulkButton, $Script:AuditBrowseButton, $HelpButton, $ReportOneButton, $ReportAllButton, $ReportPermanentButton, $Script:ReportExportButton))
 {
     Set-UiButtonStyle -Button $Button
 }
@@ -2268,6 +2571,10 @@ $Script:AllowPermanentActiveBox.Add_CheckedChanged({
 $ConnectButton.Add_Click({
     try
     {
+        $Script:ReportRows = @()
+        $Script:ReportGrid.Rows.Clear()
+        $Script:ReportExportButton.Enabled = $false
+        $Script:ReportStatus.Text = 'No report run.'
         $ConnectButton.Enabled = $false
         $Script:ConnectionStatusLabel.Text = 'Signing in to Microsoft Graph...'
         $Script:ConnectionStatusLabel.ForeColor = [System.Drawing.Color]::DarkOrange
@@ -2312,6 +2619,10 @@ $DisconnectButton.Add_Click({
         }
         $Script:ConnectionStatusLabel.Text = 'Not connected'
         $Script:ConnectionStatusLabel.ForeColor = [System.Drawing.Color]::Black
+        $Script:ReportRows = @()
+        $Script:ReportGrid.Rows.Clear()
+        $Script:ReportExportButton.Enabled = $false
+        $Script:ReportStatus.Text = 'No report run.'
         Write-UiLog 'Disconnected from Microsoft Graph.'
         $Script:AuditAccount = 'Not connected'
         $Script:AuditTenant = 'Unknown'
@@ -2460,6 +2771,18 @@ $Script:BulkCreateButton.Add_Click({ Invoke-BulkCreate })
 # ==================================================
 # ^^^^^ Bulk Creation Events ^^^^^
 # ==================================================
+
+$ReportOneButton.Add_Click({ Invoke-AssignmentReport -Mode 'OneEligible' })
+$ReportAllButton.Add_Click({ Invoke-AssignmentReport -Mode 'AllEligible' })
+$ReportPermanentButton.Add_Click({ Invoke-AssignmentReport -Mode 'Permanent' })
+$Script:ReportExportButton.Add_Click({
+    try { Export-AssignmentReport }
+    catch
+    {
+        Write-UiLog "Assignment report export failed: $($_.Exception.Message)"
+        Show-Message -Message $_.Exception.Message -Title 'Export failed' -Icon Error
+    }
+})
  
 # ==================================================
 # MARK: Initialize and Display the GUI

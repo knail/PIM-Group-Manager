@@ -14,6 +14,8 @@ The tool can create:
 - Multiple groups at once using a CSV or XLSX file
  
 For PIM-enabled groups, the tool can also configure the group's **PIM Member policy** and optionally assign users as **eligible members**.
+
+The **Assignment reports** tab provides read-only eligibility and active-membership scans with optional CSV export.
  
 The window automatically adjusts to the available screen size. If all options cannot be displayed at once, scroll through the group configuration section. The activity log remains available at the bottom of the window.
  
@@ -60,6 +62,7 @@ The requested permissions are:
 - `Group.ReadWrite.All`
 - `RoleManagementPolicy.ReadWrite.AzureADGroup`
 - `PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup`
+- `PrivilegedAssignmentSchedule.Read.AzureADGroup` (permanent-active scan)
  
 Depending on your organization's Microsoft Entra configuration, administrator consent may be required before these permissions can be used.
  
@@ -110,6 +113,25 @@ If required permissions are missing, group creation and PIM changes will remain 
  
 When you are finished using the tool, select **Disconnect**.
  
+---
+
+## Assignment reports
+
+Connect to Microsoft Graph and open **Assignment reports**:
+
+1. Enter an exact group display name or object ID and select **Query one group** to see current eligible member and owner assignments. The group must be a cloud-only, role-assignable security group with assigned membership. Use the object ID if names are duplicated.
+2. Select **Query all eligible** to find current eligible assignments across role-assignable groups.
+3. Select **Scan permanent active** to find permanent PIM active member assignments and review direct members.
+4. Review the table and select **Export results to CSV** to save findings. Names or UPNs may be blank when Graph does not return them; use the principal ID. Values that could be interpreted as spreadsheet formulas are prefixed with an apostrophe in the CSV.
+
+All-group scans include **all role-assignable groups**, whether or not they have been onboarded to PIM; PIM-managed groups that are not role-assignable are excluded. Eligible group principals, if returned by Graph, are listed as principals rather than expanded into their members. Results are a point-in-time view, not a continuous audit, and changes or Graph replication during a scan can affect results. A failed scan clears its partial results and reports the error.
+
+The permanent-active report covers membership, not ownership. **Permanent PIM active** means a current assigned (not activated) PIM membership instance with no end date. Other direct members are labeled **verify permanence**: group membership alone does not establish whether access is permanent. A member with a temporary PIM assignment is labeled separately because a concurrent direct assignment cannot be ruled out. Verify all candidates in Entra before taking action. Indirect or nested memberships are not evaluated. The scan uses the Graph beta group-members endpoint because the v1.0 endpoint can omit service principals.
+
+The permanent scan requires the additional delegated `PrivilegedAssignmentSchedule.Read.AzureADGroup` permission and a suitable Entra role, such as directory-scoped Global Reader or Privileged Role Administrator for role-assignable groups. Reconnect and obtain consent if the permission is missing. Other existing operations do not require this additional scope. Reports and CSV exports contain potentially sensitive directory data; store and share them appropriately.
+
+Run the offline, mocked report tests with `powershell.exe -NoProfile -File .\tests\AssignmentReports.Tests.ps1`.
+
 ---
  
 ## Audit Log
