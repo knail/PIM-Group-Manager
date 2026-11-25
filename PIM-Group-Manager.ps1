@@ -1604,7 +1604,7 @@ function Write-AssignmentReportFile
     {
         if ($Extension -eq '.csv')
         {
-            $SafeRows | Export-Csv -LiteralPath $TempPath -NoTypeInformation -Encoding UTF8
+            $SafeRows | Export-Csv -LiteralPath $TempPath -Encoding UTF8
         }
         else
         {
@@ -1947,7 +1947,7 @@ function New-TemplateFile
         {
             $Header[$ColumnName] = ''
         }
-        [PSCustomObject]$Header | Export-Csv -LiteralPath $Dialog.FileName -NoTypeInformation -Encoding UTF8
+        [PSCustomObject]$Header | Export-Csv -LiteralPath $Dialog.FileName -Encoding UTF8
     }
     elseif ($Extension -eq '.xlsx')
     {
@@ -2033,7 +2033,7 @@ function Export-BulkResults
     }
  
     $OutputPath = Join-Path $OutputDirectory ("PIM-Group-Creation-Results-{0}.csv" -f (Get-Date -Format 'yyyy-MM-dd_HHmmss'))
-    $Results | Export-Csv -LiteralPath $OutputPath -NoTypeInformation -Encoding UTF8
+    $Results | Export-Csv -LiteralPath $OutputPath -Encoding UTF8
     return $OutputPath
 }
  
