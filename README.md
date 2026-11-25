@@ -27,7 +27,7 @@ Larger, bold tabs highlight the selected tab in blue. Assignment results resize 
 
 Configure group properties, PIM policy settings, and optional eligible members.
 
-![Create one group tab with Eligible Assignments and Active Assignments settings](screenshots/create-one-group.png)
+![Create one group tab with Eligible Assignments and Active Assignments settings](screenshots/create-one-group.png?v=4fc64f1)
 
 ### Assignments
 
