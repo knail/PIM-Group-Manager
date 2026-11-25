@@ -25,6 +25,8 @@
     Bulk templates support group properties, PIM settings, and optional eligible
     member UPNs per row. Bulk input is validated before group creation.
     A selectable audit log records actions, results, errors, account, and tenant.
+    Connection details and Graph API methods/URLs support troubleshooting.
+    Report exports include a connection snapshot and report-specific API trace.
  
     PIM MEMBER DEFAULTS
     - Activation maximum: 8 hours; require MFA on activation.
@@ -208,6 +210,18 @@ AUDIT LOG
 
 - The file is not tamper-proof. Use Entra audit logs as the authoritative service-side record.
 
+CONNECTION AND API DIAGNOSTICS
+
+- Select Details beside the connection controls to view the account, tenant, authentication type, Graph environment, client ID, context scope, granted scopes, module version, and PowerShell version. Missing context fields are shown as null or empty, not inferred.
+
+- This script uses the global graph.microsoft.com endpoints. Displaying the Graph environment does not add support for sovereign-cloud endpoints.
+
+- The activity/audit log records Graph HTTP methods, URLs, outcomes, and HTTP status when returned. Request bodies, headers, and credentials are not part of API diagnostics; pagination tokens are redacted. URLs can still contain group names, object IDs, and UPNs.
+
+- Excel report exports include Connection and API requests worksheets (when requests were recorded). CSV exports include a companion -diagnostics.json file. Diagnostics are captured for the completed report, not the connection at export time.
+
+- A completed HTTP request is not proof of completed PIM provisioning. Keep diagnostics private and use Entra audit logs to verify service-side results.
+
 ONE GROUP
 
 1. Enter a group name. The description and mail nickname are optional; if the mail nickname is blank, the app generates one from the group name.
@@ -336,6 +350,9 @@ $Script:AssignmentWriteScope = 'PrivilegedAssignmentSchedule.ReadWrite.AzureADGr
 $Script:RoleManagementWriteScope = 'RoleManagement.ReadWrite.Directory'
 $Script:ReportRows = @()
 $Script:ReportMode = $null
+$Script:ReportDiagnostics = $null
+$Script:CaptureReportApi = $false
+$Script:ReportApiRequests = $null
 $Script:BulkRows = @()
 $Script:BulkPath = ''
 $Script:ConnectionStatusLabel = $null
@@ -775,6 +792,111 @@ function Get-GraphContext
  
     return Get-MgContext
 }
+
+function Get-GraphConnectionDetails
+{
+    param([Parameter(Mandatory = $true)]$Context)
+
+    $Module = Get-Module -Name Microsoft.Graph.Authentication
+    return [pscustomobject][ordered]@{
+        CapturedUtc = [datetime]::UtcNow.ToString('o')
+        Account = $Context.Account
+        TenantId = $Context.TenantId
+        AuthType = $Context.AuthType
+        Environment = $Context.Environment
+        ApiHost = 'graph.microsoft.com'
+        ClientId = $Context.ClientId
+        ContextScope = $Context.ContextScope
+        Scopes = @($Context.Scopes | Sort-Object -Unique)
+        GraphAuthenticationVersion = [string]$Module.Version
+        PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+    }
+}
+
+function Show-GraphConnectionDetails
+{
+    $Context = Get-GraphContext
+    if ($null -eq $Context -or [string]::IsNullOrWhiteSpace($Context.Account))
+    {
+        throw 'Connect to Microsoft Graph before viewing connection details.'
+    }
+    $Details = Get-GraphConnectionDetails -Context $Context
+    Write-UiLog "Graph connection details: $($Details | ConvertTo-Json -Depth 5 -Compress)"
+    $Dialog = New-Object System.Windows.Forms.Form
+    try
+    {
+        $Dialog.Text = 'Microsoft Graph connection details'
+        $Dialog.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+        $Dialog.Size = New-Object System.Drawing.Size(760, 560)
+        $Dialog.Padding = New-Object System.Windows.Forms.Padding(12)
+        $TextBox = Add-UiTextBox -Parent $Dialog -X 12 -Y 12 -Width 710 -Height 500 -Multiline $true
+        $TextBox.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $TextBox.ReadOnly = $true
+        $TextBox.Text = $Details | ConvertTo-Json -Depth 5
+        [void]$Dialog.ShowDialog($Script:MainForm)
+    }
+    finally { $Dialog.Dispose() }
+}
+
+function Get-GraphRequestLogUri
+{
+    param([Parameter(Mandatory = $true)][string]$Uri)
+    return $Uri -replace '(?i)([?&](?:%24|\$)?(?:skiptoken|deltatoken|access_token|token|client_secret|assertion|code)=)[^&]*', '$1[REDACTED]'
+}
+
+function Invoke-LoggedGraphRequest
+{
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('GET', 'POST', 'PATCH', 'DELETE')][string]$Method,
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [AllowNull()][object]$Body,
+        [string]$ContentType = 'application/json',
+        [switch]$SkipHttpErrorCheck,
+        [string]$StatusCodeVariable
+    )
+
+    $Entry = [pscustomobject][ordered]@{
+        TimestampUtc = [datetime]::UtcNow.ToString('o')
+        Method = $Method
+        Uri = Get-GraphRequestLogUri -Uri $Uri
+        HttpStatusCode = $null
+        Outcome = 'Pending'
+    }
+    Write-UiLog -Message "Graph API request: $Method $($Entry.Uri)" -Required:($Method -ne 'GET')
+    $StatusCode = $null
+    $Parameters = @{
+        Method = $Method
+        Uri = $Uri
+        StatusCodeVariable = 'StatusCode'
+        SkipHttpErrorCheck = $SkipHttpErrorCheck
+        ErrorAction = 'Stop'
+    }
+    if ($PSBoundParameters.ContainsKey('Body'))
+    {
+        $Parameters.Body = $Body
+        $Parameters.ContentType = $ContentType
+    }
+    try
+    {
+        $Response = Invoke-MgGraphRequest @Parameters
+        $Entry.HttpStatusCode = $StatusCode
+        $Entry.Outcome = if ($null -ne $StatusCode -and ([int]$StatusCode -lt 200 -or [int]$StatusCode -ge 300)) { 'HTTP error' } else { 'Completed' }
+        return $Response
+    }
+    catch
+    {
+        $Entry.HttpStatusCode = $StatusCode
+        $Entry.Outcome = 'Failed'
+        throw
+    }
+    finally
+    {
+        if ($StatusCodeVariable) { Set-Variable -Name $StatusCodeVariable -Value $StatusCode -Scope 1 }
+        if ($Script:CaptureReportApi) { $Script:ReportApiRequests.Add($Entry) }
+        Write-UiLog -Message "Graph API result: $Method $($Entry.Uri); outcome: $($Entry.Outcome); HTTP status: $($Entry.HttpStatusCode)" -Required:($Method -ne 'GET')
+    }
+}
  
 function Connect-ToGraph
 {
@@ -796,9 +918,11 @@ function Test-GraphConnection
         throw 'No Microsoft Graph account is connected.'
     }
  
-    $Me = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/me?$select=id,userPrincipalName' -ErrorAction Stop
+    $Me = Invoke-LoggedGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/me?$select=id,userPrincipalName' -ErrorAction Stop
     $Script:AuditAccount = $Me.userPrincipalName
     $Script:AuditTenant = $Context.TenantId
+    $Details = Get-GraphConnectionDetails -Context $Context
+    Write-UiLog "Graph connection details: $($Details | ConvertTo-Json -Depth 5 -Compress)"
     $MissingScopes = @($Script:GraphScopes | Where-Object { $Context.Scopes -notcontains $_ })
     $ScopeNote = if ($MissingScopes.Count -gt 0) { " Missing consented scopes: $($MissingScopes -join ', ')." } else { '' }
     if (-not (Test-ReportAssignmentScope -Context $Context)) { $ScopeNote += ' Permanent scan permission missing.' }
@@ -874,7 +998,7 @@ function New-EntraGroup
     Write-UiLog -Message "Submitting group creation: $ConfigurationJson" -Required
     try
     {
-        $Response = Invoke-MgGraphRequest `
+        $Response = Invoke-LoggedGraphRequest `
             -Method POST `
             -Uri 'https://graph.microsoft.com/v1.0/groups' `
             -Body ($Body | ConvertTo-Json -Depth 8) `
@@ -917,6 +1041,7 @@ function Invoke-PimGraphRequest
         [System.Collections.IDictionary]$Body
     )
  
+    $LogUri = Get-GraphRequestLogUri -Uri $Uri
     $StatusCode = $null
     $Parameters = @{
         Method = $Method
@@ -932,19 +1057,19 @@ function Invoke-PimGraphRequest
     }
     try
     {
-        $Response = Invoke-MgGraphRequest @Parameters
+        $Response = Invoke-LoggedGraphRequest @Parameters
     }
     catch
     {
-        throw "PIM Graph $Method $Uri failed: $($_.Exception.Message) $($_.ErrorDetails.Message)"
+        throw "PIM Graph $Method $LogUri failed: $($_.Exception.Message) $($_.ErrorDetails.Message)"
     }
     if ($null -eq $StatusCode)
     {
-        throw "PIM Graph $Method $Uri returned no HTTP status; the result cannot be verified."
+        throw "PIM Graph $Method $LogUri returned no HTTP status; the result cannot be verified."
     }
     if ([int]$StatusCode -lt 200 -or [int]$StatusCode -ge 300)
     {
-        $Message = "PIM Graph $Method $Uri returned HTTP $StatusCode"
+        $Message = "PIM Graph $Method $LogUri returned HTTP $StatusCode"
         if ($Response.error)
         {
             $Message += ': ' + ($Response.error | ConvertTo-Json -Depth 10 -Compress)
@@ -1334,7 +1459,7 @@ function Get-EntraUserByUpn
     $EscapedUpn = $UserPrincipalName.Replace("'", "''")
     $Filter = "userPrincipalName eq '$EscapedUpn'"
     $Uri = 'https://graph.microsoft.com/v1.0/users?$filter=' + [uri]::EscapeDataString($Filter) + '&$select=id,userPrincipalName'
-    $Response = Invoke-MgGraphRequest -Method GET -Uri $Uri -ErrorAction Stop
+    $Response = Invoke-LoggedGraphRequest -Method GET -Uri $Uri -ErrorAction Stop
     $Users = @($Response.value)
  
     if ($Users.Count -ne 1 -or [System.String]::IsNullOrWhiteSpace($Users[0].id))
@@ -1400,7 +1525,7 @@ function Add-PimEligibleMember
     Write-UiLog -Message "Submitting eligible member assignment for '$UserPrincipalName' [$($User.id)] to group $GroupId; expiration: $($ScheduleInfo.expiration | ConvertTo-Json -Compress)." -Required
     try
     {
-        Invoke-MgGraphRequest `
+        Invoke-LoggedGraphRequest `
             -Method POST `
             -Uri 'https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilityScheduleRequests' `
             -Body ($Body | ConvertTo-Json -Depth 8) `
@@ -1470,13 +1595,13 @@ function Get-GraphCollection
         if ($ParsedUri.Scheme -ne 'https' -or $ParsedUri.Host -ne 'graph.microsoft.com' -or
             -not $ParsedUri.IsDefaultPort -or $Seen.ContainsKey($Uri))
         {
-            throw "Invalid or repeated Graph pagination URL: $Uri"
+            throw "Invalid or repeated Graph pagination URL: $(Get-GraphRequestLogUri -Uri $Uri)"
         }
         $Seen[$Uri] = $true
         $Response = Invoke-PimGraphRequest -Method GET -Uri $Uri
         if ($Response -isnot [System.Collections.IDictionary] -or -not $Response.Contains('value') -or $null -eq $Response.value)
         {
-            throw "Graph returned an invalid collection for $Uri."
+            throw "Graph returned an invalid collection for $(Get-GraphRequestLogUri -Uri $Uri)."
         }
         foreach ($Item in $Response.value) { $Item }
         $Uri = [string]$Response.'@odata.nextLink'
@@ -1608,6 +1733,9 @@ function Invoke-AssignmentReport
     param([ValidateSet('OneEligible', 'AllEligible', 'Permanent')][string]$Mode)
     $Script:ReportRows = @()
     $Script:ReportMode = $null
+    $Script:ReportDiagnostics = $null
+    $Script:ReportApiRequests = [System.Collections.Generic.List[object]]::new()
+    $Script:CaptureReportApi = $true
     $Script:ReportGrid.Rows.Clear()
     $Script:ReportGrid.Columns['PrincipalId'].Visible = $Mode -ne 'AllEligible'
     $Script:ReportGrid.Columns['PrincipalType'].Visible = $Mode -ne 'AllEligible'
@@ -1643,6 +1771,7 @@ function Invoke-AssignmentReport
                 throw "The signed-in Graph session still lacks $($Script:ReportScope). Ask an administrator to grant consent, then disconnect and reconnect."
             }
         }
+        $ConnectionDetails = Get-GraphConnectionDetails -Context $Context
         $Script:TabControl.Enabled = $false
         $Script:AuditBrowseButton.Enabled = $false
         $Script:MainForm.UseWaitCursor = $true
@@ -1669,6 +1798,12 @@ function Invoke-AssignmentReport
         }
         $Script:ReportStatus.Text = "Completed: $($Groups.Count) group(s), $($Rows.Count) finding(s)."
         $Script:ReportMode = $Mode
+        $Script:ReportDiagnostics = [pscustomobject][ordered]@{
+            ReportMode = $Mode
+            CompletedUtc = [datetime]::UtcNow.ToString('o')
+            Connection = $ConnectionDetails
+            ApiRequests = $Script:ReportApiRequests.ToArray()
+        }
         $Script:ReportExportButton.Enabled = $Rows.Count -gt 0
         Write-UiLog "Assignment report ${Mode} completed: $($Groups.Count) group(s), $($Rows.Count) finding(s)."
     }
@@ -1676,6 +1811,8 @@ function Invoke-AssignmentReport
     {
         $Script:ReportRows = @()
         $Script:ReportMode = $null
+        $Script:ReportDiagnostics = $null
+        $Script:ReportDiagnostics = $null
         $Script:ReportGrid.Rows.Clear()
         $Script:ReportStatus.Text = 'Scan failed; no results displayed.'
         Write-UiLog "Assignment report ${Mode} failed: $($_.Exception.Message)"
@@ -1683,15 +1820,42 @@ function Invoke-AssignmentReport
     }
     finally
     {
+        $Script:CaptureReportApi = $false
         $Script:TabControl.Enabled = $true
         $Script:AuditBrowseButton.Enabled = $true
         $Script:MainForm.UseWaitCursor = $false
     }
 }
 
+function ConvertTo-SafeExportRows
+{
+    param([Parameter(Mandatory = $true)][object[]]$Rows)
+    foreach ($Row in $Rows)
+    {
+        $Safe = [ordered]@{}
+        foreach ($Property in $Row.PSObject.Properties)
+        {
+            $Value = if ($Property.Value -is [array]) { $Property.Value -join '; ' } else { [string]$Property.Value }
+            if ($Value -match '^[\s]*[=+\-@]' -or $Value -match '^[\t\r\n]') { $Value = "'" + $Value }
+            $Safe[$Property.Name] = $Value
+        }
+        [PSCustomObject]$Safe
+    }
+}
+
+function Get-ReportDiagnosticsPath
+{
+    param([Parameter(Mandatory = $true)][string]$Path)
+    return Join-Path ([System.IO.Path]::GetDirectoryName($Path)) ([System.IO.Path]::GetFileNameWithoutExtension($Path) + '-diagnostics.json')
+}
+
 function Write-AssignmentReportFile
 {
-    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][object[]]$Rows)
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][object[]]$Rows,
+        [AllowNull()][object]$Diagnostics
+    )
 
     $Extension = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
     if ($Extension -notin @('.csv', '.xlsx')) { throw 'Choose a .csv or .xlsx report file.' }
@@ -1703,39 +1867,55 @@ function Write-AssignmentReportFile
         }
         Import-Module ImportExcel -ErrorAction Stop
     }
-    $SafeRows = foreach ($Row in $Rows)
-    {
-        $Safe = [ordered]@{}
-        foreach ($Property in $Row.PSObject.Properties)
-        {
-            $Value = [string]$Property.Value
-            if ($Value -match '^[\s]*[=+\-@]' -or $Value -match '^[\t\r\n]') { $Value = "'" + $Value }
-            $Safe[$Property.Name] = $Value
-        }
-        [PSCustomObject]$Safe
-    }
+    $SafeRows = @(ConvertTo-SafeExportRows -Rows $Rows)
     $TempPath = Join-Path ([System.IO.Path]::GetDirectoryName($Path)) ('.PIM-Assignment-Report-' + [guid]::NewGuid().ToString() + $Extension)
+    $TempDiagnosticsPath = $null
     try
     {
         if ($Extension -eq '.csv')
         {
             $SafeRows | Export-Csv -LiteralPath $TempPath -Encoding UTF8
+            if ($null -ne $Diagnostics)
+            {
+                $TempDiagnosticsPath = $TempPath + '.json'
+                $Diagnostics | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $TempDiagnosticsPath -Encoding UTF8
+            }
         }
         else
         {
             $SafeRows | Export-Excel -Path $TempPath -WorksheetName 'Assignments' -TableName 'PIMAssignments' -TableStyle Light20 -AutoSize -FreezeTopRow -AutoFilter -NoNumberConversion '*' -NoHyperLinkConversion '*'
+            if ($null -ne $Diagnostics)
+            {
+                $ConnectionRow = $Diagnostics.Connection | Select-Object -Property *,
+                    @{ Name = 'ReportMode'; Expression = { $Diagnostics.ReportMode } },
+                    @{ Name = 'CompletedUtc'; Expression = { $Diagnostics.CompletedUtc } }
+                ConvertTo-SafeExportRows -Rows @($ConnectionRow) |
+                    Export-Excel -Path $TempPath -WorksheetName 'Connection' -TableName 'GraphConnection' -TableStyle Light20 -AutoSize -FreezeTopRow -NoNumberConversion '*' -NoHyperLinkConversion '*'
+                if (@($Diagnostics.ApiRequests).Count -gt 0)
+                {
+                    ConvertTo-SafeExportRows -Rows @($Diagnostics.ApiRequests) |
+                        Export-Excel -Path $TempPath -WorksheetName 'API requests' -TableName 'GraphApiRequests' -TableStyle Light20 -AutoSize -FreezeTopRow -NoNumberConversion '*' -NoHyperLinkConversion '*'
+                }
+            }
         }
         Move-Item -LiteralPath $TempPath -Destination $Path -Force -ErrorAction Stop
+        if ($TempDiagnosticsPath)
+        {
+            $DiagnosticsPath = Get-ReportDiagnosticsPath -Path $Path
+            try { Move-Item -LiteralPath $TempDiagnosticsPath -Destination $DiagnosticsPath -Force -ErrorAction Stop }
+            catch { throw "CSV report was saved to '$Path', but its diagnostics could not be saved to '$DiagnosticsPath': $($_.Exception.Message)" }
+        }
     }
     finally
     {
         if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -ErrorAction Stop }
+        if ($TempDiagnosticsPath -and (Test-Path -LiteralPath $TempDiagnosticsPath)) { Remove-Item -LiteralPath $TempDiagnosticsPath -ErrorAction Stop }
     }
 }
 
 function Export-AssignmentReport
 {
-    if ($Script:ReportRows.Count -eq 0) { throw 'Run a report with findings before exporting.' }
+    if (@($Script:ReportRows).Count -eq 0) { throw 'Run a report with findings before exporting.' }
     $Dialog = New-Object System.Windows.Forms.SaveFileDialog
     try
     {
@@ -1753,9 +1933,16 @@ function Export-AssignmentReport
             default { throw 'The report type is unavailable. Run the report again before exporting.' }
         }
         $Dialog.FileName = "$(Get-Date -Format 'yyyy-MM-dd_HHmm')-$ReportName-PIM-Assignment-Report"
+        if ($null -eq $Script:ReportDiagnostics) { throw 'Report diagnostics are unavailable. Run the report again before exporting.' }
         if ($Dialog.ShowDialog($Script:MainForm) -ne [System.Windows.Forms.DialogResult]::OK) { return }
-        Write-AssignmentReportFile -Path $Dialog.FileName -Rows @($Script:ReportRows)
-        Write-UiLog "Assignment report exported to '$($Dialog.FileName)' ($($Script:ReportRows.Count) findings)."
+        $DiagnosticsPath = if ([System.IO.Path]::GetExtension($Dialog.FileName) -eq '.csv') { Get-ReportDiagnosticsPath -Path $Dialog.FileName } else { $null }
+        if ($DiagnosticsPath -and (Test-Path -LiteralPath $DiagnosticsPath) -and
+            [System.Windows.Forms.MessageBox]::Show($Script:MainForm, "Replace existing diagnostics file '$DiagnosticsPath'?",
+                'Confirm diagnostics overwrite', [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Warning) -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+        Write-AssignmentReportFile -Path $Dialog.FileName -Rows @($Script:ReportRows) -Diagnostics $Script:ReportDiagnostics
+        Write-UiLog "Assignment report exported to '$($Dialog.FileName)' ($(@($Script:ReportRows).Count) findings)."
+        if ($DiagnosticsPath) { Write-UiLog "Report diagnostics exported to '$DiagnosticsPath'." }
     }
     finally { $Dialog.Dispose() }
 }
@@ -1870,6 +2057,7 @@ function Show-AddEligibleMembers
             $Script:ReportGroupBox.Text = $Group.id
             $Script:ReportRows = @()
             $Script:ReportMode = $null
+            $Script:ReportDiagnostics = $null
             $Script:ReportGrid.Rows.Clear()
             $Script:ReportExportButton.Enabled = $false
             $Script:ReportStatus.Text = 'Assignments may have changed; run a new report.'
@@ -2018,7 +2206,7 @@ function Invoke-MemberRemoval
     if ($Operation.Category -eq 'Group membership')
     {
         $Uri = "https://graph.microsoft.com/v1.0/groups/$ParsedGroup/members/$ParsedUser/`$ref"
-        Invoke-MgGraphRequest -Method DELETE -Uri $Uri -ErrorAction Stop | Out-Null
+        Invoke-LoggedGraphRequest -Method DELETE -Uri $Uri -ErrorAction Stop | Out-Null
         $Result = 'Group membership DELETE accepted'
     }
     else
@@ -2028,7 +2216,7 @@ function Invoke-MemberRemoval
             action = 'adminRemove'; accessId = 'member'; groupId = $ParsedGroup.ToString(); principalId = $ParsedUser.ToString()
             justification = 'Membership removal requested by PIM Group Manager.'
         }
-        $Response = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/$Endpoint" `
+        $Response = Invoke-LoggedGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/$Endpoint" `
             -Body ($Body | ConvertTo-Json -Depth 8) -ContentType 'application/json' -ErrorAction Stop
         if ([string]::IsNullOrWhiteSpace([string]$Response.id) -or [string]::IsNullOrWhiteSpace([string]$Response.status))
         {
@@ -2891,26 +3079,33 @@ $ConnectionGroup.Anchor = 'Top, Left, Right'
 $ConnectionGroup.BackColor = [System.Drawing.Color]::White
 $Script:MainForm.Controls.Add($ConnectionGroup)
  
-$Script:ConnectionStatusLabel = Add-UiLabel -Parent $ConnectionGroup -Text 'Not connected' -X 12 -Y 24 -Width 625 -Height 28
+$Script:ConnectionStatusLabel = Add-UiLabel -Parent $ConnectionGroup -Text 'Not connected' -X 12 -Y 24 -Width 515 -Height 28
 $Script:ConnectionStatusLabel.Anchor = 'Top, Left, Right'
+$Script:ConnectionStatusLabel.AutoEllipsis = $true
 $ConnectButton = New-Object System.Windows.Forms.Button
 $ConnectButton.Text = 'Connect / Login'
-$ConnectButton.Location = New-Object System.Drawing.Point(650, 22)
+$ConnectButton.Location = New-Object System.Drawing.Point(540, 22)
 $ConnectButton.Size = New-Object System.Drawing.Size(112, 30)
 $ConnectButton.Anchor = 'Top, Right'
 $ConnectionGroup.Controls.Add($ConnectButton)
 $CheckConnectionButton = New-Object System.Windows.Forms.Button
 $CheckConnectionButton.Text = 'Check connection'
-$CheckConnectionButton.Location = New-Object System.Drawing.Point(770, 22)
+$CheckConnectionButton.Location = New-Object System.Drawing.Point(660, 22)
 $CheckConnectionButton.Size = New-Object System.Drawing.Size(120, 30)
 $CheckConnectionButton.Anchor = 'Top, Right'
 $ConnectionGroup.Controls.Add($CheckConnectionButton)
 $DisconnectButton = New-Object System.Windows.Forms.Button
 $DisconnectButton.Text = 'Disconnect'
-$DisconnectButton.Location = New-Object System.Drawing.Point(898, 22)
+$DisconnectButton.Location = New-Object System.Drawing.Point(788, 22)
 $DisconnectButton.Size = New-Object System.Drawing.Size(90, 30)
 $DisconnectButton.Anchor = 'Top, Right'
 $ConnectionGroup.Controls.Add($DisconnectButton)
+$ConnectionDetailsButton = New-Object System.Windows.Forms.Button
+$ConnectionDetailsButton.Text = 'Details'
+$ConnectionDetailsButton.Location = New-Object System.Drawing.Point(886, 22)
+$ConnectionDetailsButton.Size = New-Object System.Drawing.Size(102, 30)
+$ConnectionDetailsButton.Anchor = 'Top, Right'
+$ConnectionGroup.Controls.Add($ConnectionDetailsButton)
  
 $Script:TabControl = New-Object System.Windows.Forms.TabControl
 $Script:TabControl.Location = New-Object System.Drawing.Point(12, 142)
@@ -3281,7 +3476,7 @@ $Script:LogBox.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
 $Script:LogBox.BackColor = [System.Drawing.Color]::White
 $Script:MainForm.Controls.Add($Script:LogBox)
  
-foreach ($Button in @($CheckConnectionButton, $DisconnectButton, $Script:ApplyExistingButton, $TemplateButton, $ImportBulkButton, $Script:AuditBrowseButton, $HelpButton, $ReportOneButton, $ReportAllButton, $ReportPermanentButton, $Script:ReportExportButton, $RemoveMembersButton, $AddEligibleButton))
+foreach ($Button in @($CheckConnectionButton, $DisconnectButton, $ConnectionDetailsButton, $Script:ApplyExistingButton, $TemplateButton, $ImportBulkButton, $Script:AuditBrowseButton, $HelpButton, $ReportOneButton, $ReportAllButton, $ReportPermanentButton, $Script:ReportExportButton, $RemoveMembersButton, $AddEligibleButton))
 {
     Set-UiButtonStyle -Button $Button
 }
@@ -3363,6 +3558,7 @@ $ConnectButton.Add_Click({
     {
         $Script:ReportRows = @()
         $Script:ReportMode = $null
+        $Script:ReportDiagnostics = $null
         $Script:ReportGrid.Rows.Clear()
         $Script:ReportExportButton.Enabled = $false
         $Script:ReportStatus.Text = 'No report run.'
@@ -3400,6 +3596,14 @@ $CheckConnectionButton.Add_Click({
         Show-Message -Message $_.Exception.Message -Title 'Connection check failed' -Icon Error
     }
 })
+$ConnectionDetailsButton.Add_Click({
+    try { Show-GraphConnectionDetails }
+    catch
+    {
+        Write-UiLog "Connection details unavailable: $($_.Exception.Message)"
+        Show-Message -Message $_.Exception.Message -Title 'Connection details unavailable' -Icon Error
+    }
+})
 $DisconnectButton.Add_Click({
     try
     {
@@ -3412,6 +3616,7 @@ $DisconnectButton.Add_Click({
         $Script:ConnectionStatusLabel.ForeColor = [System.Drawing.Color]::Black
         $Script:ReportRows = @()
         $Script:ReportMode = $null
+        $Script:ReportDiagnostics = $null
         $Script:ReportGrid.Rows.Clear()
         $Script:ReportExportButton.Enabled = $false
         $Script:ReportStatus.Text = 'No report run.'

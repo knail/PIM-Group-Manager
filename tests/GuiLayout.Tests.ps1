@@ -68,6 +68,11 @@ try
         $ReportLayout.PerformLayout()
         $ReportHeader.PerformLayout()
         $ReportFooter.PerformLayout()
+        foreach ($Control in $ConnectionGroup.Controls)
+        {
+            Assert-True ($ConnectionGroup.ClientRectangle.Contains($Control.Bounds)) "Connection control is clipped at $Size."
+        }
+        Assert-True (-not $Script:ConnectionStatusLabel.Bounds.IntersectsWith($ConnectButton.Bounds)) "Connection status overlaps buttons at $Size."
         Assert-True ($ReportTab.ClientRectangle.Contains($ReportLayout.Bounds)) "Report layout exceeds the tab at $Size."
         Assert-True ($ReportLayout.ClientRectangle.Contains($ReportFooter.Bounds)) "Export footer is clipped at $Size."
         Assert-True ($ReportFooter.ClientRectangle.Contains($Script:ReportExportButton.Bounds)) "Export button is clipped at $Size."

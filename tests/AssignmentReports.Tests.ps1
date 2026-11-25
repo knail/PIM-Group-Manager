@@ -7,7 +7,9 @@ $Names = @('Get-GraphCollection', 'Get-ReportGroups', 'Get-GroupReportInstances'
     'Test-CurrentReportInstance', 'New-AssignmentReportRow', 'Get-EligibleReportRows', 'Get-PermanentReportRows',
     'Test-ReportAssignmentScope', 'Write-AssignmentReportFile', 'ConvertTo-EligibleMemberUPNs',
     'Get-ExistingPimGroup', 'Get-EntraUserByUpn', 'Add-PimEligibleMember', 'New-EligibleAssignmentSchedule',
-    'Get-MemberRemovalPlan', 'Invoke-MemberRemoval', 'Invoke-MemberRemovalBatch')
+    'Get-MemberRemovalPlan', 'Invoke-MemberRemoval', 'Invoke-MemberRemovalBatch',
+    'Invoke-LoggedGraphRequest', 'Get-GraphRequestLogUri', 'Get-GraphConnectionDetails',
+    'ConvertTo-SafeExportRows', 'Get-ReportDiagnosticsPath')
 foreach ($Name in $Names)
 {
     $Function = $Ast.Find({ param($Node) $Node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $Node.Name -eq $Name }, $true)
@@ -247,18 +249,27 @@ $TestDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('PimReportTest-' +
 [void](New-Item -ItemType Directory -Path $TestDirectory)
 $CsvPath = Join-Path $TestDirectory 'report.csv'
 $ExcelPath = Join-Path $TestDirectory 'report.xlsx'
+$DiagnosticsPath = Get-ReportDiagnosticsPath -Path $CsvPath
 try
 {
     $Rows = @([pscustomobject][ordered]@{ GroupName = '=danger'; PrincipalName = 'Sample'; GroupId = '00123' })
-    Write-AssignmentReportFile -Path $CsvPath -Rows $Rows
+    $Diagnostics = [pscustomobject]@{
+        ReportMode = 'AllEligible'
+        Connection = [pscustomobject]@{ Account = '=connection'; TenantId = 'test-tenant'; Scopes = @('User.Read', 'Group.ReadWrite.All') }
+        ApiRequests = @([pscustomobject]@{ Method = 'GET'; Uri = 'https://graph.microsoft.com/v1.0/groups'; HttpStatusCode = 200; Outcome = 'Completed' })
+    }
+    Write-AssignmentReportFile -Path $CsvPath -Rows $Rows -Diagnostics $Diagnostics
     $Csv = @(Import-Csv -LiteralPath $CsvPath)
     Assert-True ($Csv.Count -eq 1 -and $Csv[0].GroupName -eq "'=danger" -and $Csv[0].GroupId -eq '00123') 'CSV export must protect formulas and preserve text.'
+    $SavedDiagnostics = Get-Content -LiteralPath $DiagnosticsPath -Raw | ConvertFrom-Json
+    Assert-True ($SavedDiagnostics.ReportMode -eq 'AllEligible' -and $SavedDiagnostics.Connection.Account -eq '=connection' -and
+        $SavedDiagnostics.ApiRequests[0].Method -eq 'GET') 'CSV companion must preserve the report connection and request metadata.'
     $Rows[0].PrincipalName = 'Updated'
     Write-AssignmentReportFile -Path $CsvPath -Rows $Rows
     Assert-True ((Import-Csv -LiteralPath $CsvPath).PrincipalName -eq 'Updated') 'CSV overwrite should replace the previous report.'
     if (Get-Module -ListAvailable -Name ImportExcel)
     {
-        Write-AssignmentReportFile -Path $ExcelPath -Rows $Rows
+        Write-AssignmentReportFile -Path $ExcelPath -Rows $Rows -Diagnostics $Diagnostics
         $Excel = @(Import-Excel -Path $ExcelPath -WorksheetName 'Assignments')
         Assert-True ($Excel.Count -eq 1 -and $Excel[0].GroupName -eq "'=danger" -and $Excel[0].GroupId -eq '00123') 'Excel export must protect formulas and preserve text.'
         $Package = Open-ExcelPackage -Path $ExcelPath
@@ -267,6 +278,12 @@ try
             $Worksheet = $Package.Workbook.Worksheets['Assignments']
             Assert-True ([string]::IsNullOrWhiteSpace($Worksheet.Cells['A2'].Formula)) 'Excel cell must not be a formula.'
             Assert-True ($Worksheet.Tables.Count -eq 1 -and $Worksheet.Tables['PIMAssignments'].StyleName -eq 'TableStyleLight20') 'Excel report must contain a Light20 table.'
+            $ConnectionSheet = $Package.Workbook.Worksheets['Connection']
+            $ApiSheet = $Package.Workbook.Worksheets['API requests']
+            Assert-True ($ConnectionSheet.Cells['A2'].Text -eq "'=connection" -and
+                [string]::IsNullOrWhiteSpace($ConnectionSheet.Cells['A2'].Formula)) 'Connection metadata must also protect spreadsheet formulas.'
+            Assert-True ($ConnectionSheet.Cells['C2'].Text -eq 'User.Read; Group.ReadWrite.All' -and
+                $ApiSheet.Cells['A2'].Text -eq 'GET' -and $ApiSheet.Tables['GraphApiRequests'].StyleName -eq 'TableStyleLight20') 'Excel diagnostics worksheets must contain the connection scopes and API trace.'
         }
         finally { Close-ExcelPackage -ExcelPackage $Package -NoSave }
         $Rows[0].PrincipalName = 'Replaced'
@@ -280,11 +297,28 @@ try
         catch { if ($_.Exception.Message -notmatch 'ImportExcel is required') { throw } }
     }
     finally { Remove-Item -LiteralPath 'Function:\Get-Module' }
+    function Move-Item
+    {
+        [CmdletBinding()]
+        param($LiteralPath, $Destination, [switch]$Force)
+        if ($Destination -eq $DiagnosticsPath) { throw 'Simulated diagnostics publication failure.' }
+        Microsoft.PowerShell.Management\Move-Item @PSBoundParameters
+    }
+    try
+    {
+        $Rows[0].PrincipalName = 'Partial export'
+        try { Write-AssignmentReportFile -Path $CsvPath -Rows $Rows -Diagnostics $Diagnostics; throw 'Partial export was reported as successful.' }
+        catch { if ($_.Exception.Message -notmatch 'CSV report was saved.*diagnostics could not be saved') { throw } }
+        Assert-True ((Import-Csv -LiteralPath $CsvPath).PrincipalName -eq 'Partial export' -and
+            @(Get-ChildItem -LiteralPath $TestDirectory -Filter '.PIM-Assignment-Report-*').Count -eq 0) 'Partial publication must report the saved CSV and clean up its staged diagnostics.'
+    }
+    finally { Remove-Item -LiteralPath 'Function:\Move-Item' }
 }
 finally
 {
     if (Test-Path -LiteralPath $CsvPath) { Remove-Item -LiteralPath $CsvPath }
     if (Test-Path -LiteralPath $ExcelPath) { Remove-Item -LiteralPath $ExcelPath }
+    if (Test-Path -LiteralPath $DiagnosticsPath) { Remove-Item -LiteralPath $DiagnosticsPath }
     Remove-Item -LiteralPath $TestDirectory
 }
 foreach ($Name in @('Invoke-AssignmentReport', 'Export-AssignmentReport'))
@@ -299,11 +333,27 @@ function Test-ReportExportDialog($Dialog)
     return [System.Windows.Forms.DialogResult]::Cancel
 }
 function Assert-GraphReady { if ($Script:FailReport) { throw 'Simulated report failure.' } }
-function Get-GraphContext { return @{ Scopes = @($Script:ReportScope) } }
+function Get-GraphContext { return $Script:TestReportContext }
 function Get-ReportGroups { return @{ id = 'test-group'; displayName = 'Test group' } }
 function Get-ExistingPimGroup { param($GroupNameOrId) Get-ReportGroups }
-function Get-EligibleReportRows { param($Group, $Now) return $Script:TestReportRow }
-function Get-PermanentReportRows { param($Group, $Now) return $Script:TestReportRow }
+function Invoke-MgGraphRequest
+{
+    param($Method, $Uri, $StatusCodeVariable, $SkipHttpErrorCheck, $ErrorAction)
+    Set-Variable -Name $StatusCodeVariable -Value 200 -Scope 1
+    return @{}
+}
+function Get-EligibleReportRows
+{
+    param($Group, $Now)
+    Invoke-LoggedGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilityScheduleInstances' | Out-Null
+    return $Script:TestReportRow
+}
+function Get-PermanentReportRows
+{
+    param($Group, $Now)
+    Invoke-LoggedGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleInstances' | Out-Null
+    return $Script:TestReportRow
+}
 function Show-Message { param($Message, $Title, $Icon) $Script:ReportError = $Message }
 $Script:TestReportRow = [pscustomobject]@{ GroupName = 'Test group'; GroupId = 'test-group'; Finding = 'Example'; Access = 'member'; PrincipalName = 'Example user'; UserPrincipalName = 'example@example.invalid'; PrincipalId = 'test-user'; PrincipalType = 'User'; StartUtc = ''; EndUtc = '' }
 $Script:ReportGrid = New-Object System.Windows.Forms.DataGridView
@@ -317,6 +367,7 @@ $Script:ReportGroupBox = [pscustomobject]@{ Text = 'Test group' }
 $Script:ReportStatus = [pscustomobject]@{ Text = '' }
 $Script:ReportStatus | Add-Member ScriptMethod Refresh {}
 $Script:FailReport = $false
+$Script:TestReportContext = @{ Scopes = @($Script:ReportScope); Account = 'report@example.invalid'; TenantId = 'report-tenant'; AuthType = 'Delegated'; Environment = 'Global' }
 try
 {
     foreach ($Case in @(
@@ -324,15 +375,20 @@ try
         @{ Mode = 'Permanent'; Suffix = 'all-permanent' },
         @{ Mode = 'OneEligible'; Suffix = 'one-group-eligible' }))
     {
+        $Script:TestReportContext.Account = 'report@example.invalid'
         Invoke-AssignmentReport -Mode $Case.Mode
         Assert-True (@($Script:ReportRows).Count -eq 1 -and $Script:ReportMode -eq $Case.Mode) "Completed report must retain its type with its results. $Script:ReportError"
+        $Script:TestReportContext.Account = 'changed@example.invalid'
+        Assert-True ($Script:ReportDiagnostics.Connection.Account -eq 'report@example.invalid' -and
+            $Script:ReportDiagnostics.ApiRequests.Count -eq 1 -and -not $Script:CaptureReportApi) 'Each report must preserve its original connection and its own API trace, without previous-report requests.'
         $Script:ExpectedReportSuffix = $Case.Suffix
         Export-AssignmentReport
     }
     $Script:FailReport = $true
     Invoke-AssignmentReport -Mode 'AllEligible'
     Assert-True ($Script:ReportMode -eq $null -and $Script:ReportRows.Count -eq 0 -and
-        $Script:ReportError -match 'Simulated report failure') 'Failed reports must discard both their results and filename metadata.'
+        $Script:ReportDiagnostics -eq $null -and -not $Script:CaptureReportApi -and
+        $Script:ReportError -match 'Simulated report failure') 'Failed reports must discard results and diagnostics, and stop capturing API requests.'
     $Script:ReportRows = @($Script:TestReportRow)
     try { Export-AssignmentReport; throw 'Missing report type was accepted.' }
     catch { if ($_.Exception.Message -notmatch 'report type is unavailable') { throw } }

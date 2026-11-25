@@ -128,6 +128,10 @@ Before creating or modifying groups, connect the application to Microsoft Entra.
 4. Sign in using the account that will create or manage the groups.
 5. If prompted, grant or request administrator consent for the required Microsoft Graph permissions.
 6. Select **Check connection**.
+
+Select **Details** beside the connection buttons to view a copyable connection snapshot: account, tenant ID, authentication type, Graph environment, public client ID, context scope, granted scopes, loaded Microsoft.Graph.Authentication version, and PowerShell version. Missing context fields remain null or empty rather than being guessed. Successful connection checks also record these details in the audit log.
+
+The script currently targets **global Microsoft Graph (`graph.microsoft.com`)**. The environment shown in Details describes the Graph session; it does not imply support for sovereign-cloud API endpoints.
  
 The connection check verifies:
  
@@ -158,7 +162,16 @@ The permanent-active report covers membership, not ownership. **Permanent PIM ac
 
 The permanent scan requires the delegated `PrivilegedAssignmentSchedule.Read.AzureADGroup` permission (or its ReadWrite equivalent) and a suitable Entra role, such as directory-scoped Global Reader or Privileged Role Administrator for role-assignable groups. If the permission is missing, the scan offers to reconnect and request consent; an administrator may need to grant it. Other existing operations do not require this additional scope. Reports and exports contain potentially sensitive directory data; store and share them appropriately.
 
-Run the offline, mocked report tests with `powershell.exe -NoProfile -File .\tests\AssignmentReports.Tests.ps1`.
+### Report diagnostics
+
+Exports preserve the connection snapshot and API requests from the completed report, even if the connection changes before export:
+
+- **Excel:** the existing **Assignments** worksheet remains unchanged. **Connection** contains the connection snapshot, report type, and completion time. **API requests** contains each recorded request's UTC time, HTTP method, URL, outcome, and HTTP status when returned. All tables use **Light20**.
+- **CSV:** report columns remain unchanged. A companion file named `<report-name>-diagnostics.json` contains the connection snapshot and API requests. An existing companion file requires overwrite confirmation. If the report saves but the companion cannot be published, the GUI reports the partial export explicitly.
+
+Graph requests made by the script are also written to the activity/audit log. API diagnostics exclude request bodies, headers, and credentials, and redact pagination tokens. URLs can still contain group names, object IDs, and UPNs; treat these files as sensitive directory data and redact them before sharing publicly. SDK-internal retries and token acquisition are not separately traced. A completed request does not prove completed PIM provisioning; verify request status and Entra audit logs.
+
+Run the offline, mocked tests with `powershell.exe -STA -NoProfile -Command '& .\tests\Diagnostics.Tests.ps1; & .\tests\AssignmentReports.Tests.ps1'`.
 
 ### Add eligible members
 
