@@ -3281,13 +3281,15 @@ $Script:LogBox.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
 $Script:LogBox.BackColor = [System.Drawing.Color]::White
 $Script:MainForm.Controls.Add($Script:LogBox)
  
-foreach ($Button in @($CheckConnectionButton, $DisconnectButton, $Script:ApplyExistingButton, $TemplateButton, $ImportBulkButton, $Script:AuditBrowseButton, $HelpButton, $ReportOneButton, $ReportAllButton, $ReportPermanentButton, $Script:ReportExportButton, $RemoveMembersButton))
+foreach ($Button in @($CheckConnectionButton, $DisconnectButton, $Script:ApplyExistingButton, $TemplateButton, $ImportBulkButton, $Script:AuditBrowseButton, $HelpButton, $ReportOneButton, $ReportAllButton, $ReportPermanentButton, $Script:ReportExportButton, $RemoveMembersButton, $AddEligibleButton))
 {
     Set-UiButtonStyle -Button $Button
 }
 $RemoveMembersButton.ForeColor = [System.Drawing.Color]::DarkRed
 $RemoveMembersButton.FlatAppearance.BorderColor = [System.Drawing.Color]::IndianRed
-foreach ($Button in @($ConnectButton, $CreateButton, $Script:BulkCreateButton, $AddEligibleButton))
+$AddEligibleButton.ForeColor = [System.Drawing.Color]::DarkGreen
+$AddEligibleButton.FlatAppearance.BorderColor = [System.Drawing.Color]::DarkGreen
+foreach ($Button in @($ConnectButton, $CreateButton, $Script:BulkCreateButton))
 {
     Set-UiButtonStyle -Button $Button -Primary $true
 }
