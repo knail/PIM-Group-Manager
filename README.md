@@ -20,6 +20,20 @@ The **Assignments** tab groups **Query one group**, **Add eligible members**, an
 The window automatically adjusts to the available screen size. If all options cannot be displayed at once, scroll through the group configuration section. The activity log remains available at the bottom of the window.
 
 Larger, bold tabs highlight the selected tab in blue. Assignment results resize with the window; **Export results** remains in a separate footer, and the group-action sections scroll when needed.
+
+## GUI examples
+
+### Create one group
+
+Configure group properties, PIM policy settings, and optional eligible members.
+
+![Create one group tab with Eligible Assignments and Active Assignments settings](screenshots/create-one-group.png)
+
+### Assignments
+
+Query a group, add or remove members, scan all groups, and export report results.
+
+![Assignments tab with single-group actions, all-group reports, and export results](screenshots/assignments.png)
  
 ---
  
