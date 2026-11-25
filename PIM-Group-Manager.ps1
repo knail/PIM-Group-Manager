@@ -73,6 +73,7 @@
     Version     : 1.3
     Modified    : 2026-11-21
     Purpose     : Create Entra groups and configure PIM Member settings.
+    Repository  : https://github.com/knail/PIM-Group-Manager
  
     A role-assignable group must be a security group with assigned membership.
     Creating it does not assign an Entra role; assign roles separately.
@@ -113,7 +114,7 @@
           existing-group recovery, and validation behavior.
  
 .LINK
-    PIM-Group-Manager-HowTo.md
+    https://github.com/knail/PIM-Group-Manager
 #>
  
 # ==================================================
