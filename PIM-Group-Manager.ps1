@@ -38,7 +38,7 @@
     REQUIREMENTS
     - Windows PowerShell 5.1 in STA mode and network access to Microsoft Graph.
     - Microsoft.Graph.Authentication PowerShell module.
-    - ImportExcel module for XLSX templates and imports; CSV does not require it.
+    - ImportExcel module for XLSX templates, imports, and report exports; CSV does not require it.
     - Microsoft Entra ID P2 or EMS E5 licensing for PIM.
     - Appropriate Entra directory role, generally Privileged Role Administrator
       for creating role-assignable groups and managing their PIM settings.
@@ -134,7 +134,7 @@ PREREQUISITES
 
 - Install Microsoft.Graph.Authentication: Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
 
-- XLSX files need ImportExcel: Install-Module ImportExcel -Scope CurrentUser. CSV works without it.
+- XLSX templates, imports, and report exports need ImportExcel: Install-Module ImportExcel -Scope CurrentUser. CSV works without it.
 
 - PIM requires Microsoft Entra ID P2 or EMS E5 licensing.
 
@@ -212,7 +212,11 @@ ASSIGNMENT REPORTS
 
 2. Select Query all eligible to scan all role-assignable groups for current eligible members and owners. Select Scan permanent active to inspect active member assignments and direct members.
 
-3. Review the results and optionally export them to CSV. Results contain directory information; protect the exported file.
+3. Review the results and optionally export them to Excel or CSV. Excel is the default when ImportExcel is installed. Results contain directory information; protect the exported file.
+
+- If the permanent scan needs additional permission, choose whether to reconnect and request consent. An administrator may need to grant it.
+
+- The all-groups eligible report omits principal ID and type. Query a group individually to see them.
 
 - Role-assignable groups are included even if not onboarded to PIM. Other groups are not included. Direct members are candidates, not proof of permanence; verify in Entra. A member with a temporary PIM assignment may also have separate direct access.
 
@@ -737,8 +741,9 @@ function Test-GraphConnection
     $Script:AuditTenant = $Context.TenantId
     $MissingScopes = @($Script:GraphScopes | Where-Object { $Context.Scopes -notcontains $_ })
     $ScopeNote = if ($MissingScopes.Count -gt 0) { " Missing consented scopes: $($MissingScopes -join ', ')." } else { '' }
+    if (-not (Test-ReportAssignmentScope -Context $Context)) { $ScopeNote += ' Permanent scan permission missing.' }
     $Script:ConnectionStatusLabel.Text = "Connected: $($Me.userPrincipalName) | Tenant: $($Context.TenantId)$ScopeNote"
-    $Script:ConnectionStatusLabel.ForeColor = if ($MissingScopes.Count -gt 0) { [System.Drawing.Color]::DarkOrange } else { [System.Drawing.Color]::DarkGreen }
+    $Script:ConnectionStatusLabel.ForeColor = if ($MissingScopes.Count -gt 0 -or -not (Test-ReportAssignmentScope -Context $Context)) { [System.Drawing.Color]::DarkOrange } else { [System.Drawing.Color]::DarkGreen }
  
     if ($MissingScopes.Count -gt 0)
     {
@@ -1479,19 +1484,51 @@ function Get-PermanentReportRows
     }
 }
 
+function Test-ReportAssignmentScope
+{
+    param($Context)
+    return ($Context.Scopes -contains $Script:ReportScope -or
+        $Context.Scopes -contains 'PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup')
+}
+
 function Invoke-AssignmentReport
 {
     param([ValidateSet('OneEligible', 'AllEligible', 'Permanent')][string]$Mode)
     $Script:ReportRows = @()
     $Script:ReportGrid.Rows.Clear()
+    $Script:ReportGrid.Columns['PrincipalId'].Visible = $Mode -ne 'AllEligible'
+    $Script:ReportGrid.Columns['PrincipalType'].Visible = $Mode -ne 'AllEligible'
     $Script:ReportStatus.Text = 'Scanning...'
     $Script:ReportExportButton.Enabled = $false
     try
     {
         Assert-GraphReady
-        if ($Mode -eq 'Permanent' -and (Get-GraphContext).Scopes -notcontains $Script:ReportScope)
+        $Context = Get-GraphContext
+        if ($Mode -eq 'Permanent' -and -not (Test-ReportAssignmentScope -Context $Context))
         {
-            throw "Reconnect to Microsoft Graph and consent to $($Script:ReportScope) for the permanent-access scan."
+            $Prompt = "The permanent-access scan needs $($Script:ReportScope). Reconnect to request consent now? An administrator may need to grant it."
+            if ([System.Windows.Forms.MessageBox]::Show($Script:MainForm, $Prompt, 'Additional Graph permission',
+                [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question) -ne [System.Windows.Forms.DialogResult]::Yes)
+            {
+                throw "Permission was not requested. Reconnect and obtain consent for $($Script:ReportScope) before scanning."
+            }
+            $OriginalAccount = $Context.Account
+            $OriginalTenant = $Context.TenantId
+            Write-UiLog "Requesting Graph consent for the permanent-access report."
+            Connect-MgGraph -Scopes ($Script:GraphScopes + $Script:ReportScope) -TenantId $OriginalTenant -ContextScope Process -ErrorAction Stop | Out-Null
+            $Context = Get-GraphContext
+            if ($null -eq $Context -or $Context.Account -ne $OriginalAccount -or $Context.TenantId -ne $OriginalTenant)
+            {
+                $Script:ConnectionStatusLabel.Text = 'Connection changed; check connection'
+                $Script:ConnectionStatusLabel.ForeColor = [System.Drawing.Color]::DarkOrange
+                throw 'The Graph account or tenant changed during sign-in. Check the connection and run the report again.'
+            }
+            [void](Test-GraphConnection)
+            Assert-GraphReady
+            if (-not (Test-ReportAssignmentScope -Context $Context))
+            {
+                throw "The signed-in Graph session still lacks $($Script:ReportScope). Ask an administrator to grant consent, then disconnect and reconnect."
+            }
         }
         $Script:TabControl.Enabled = $false
         $Script:AuditBrowseButton.Enabled = $false
@@ -1510,7 +1547,9 @@ function Invoke-AssignmentReport
             $Findings = if ($Mode -eq 'Permanent') { @(Get-PermanentReportRows -Group $Group -Now $Now) } else { @(Get-EligibleReportRows -Group $Group -Now $Now) }
             foreach ($Finding in $Findings) { $Rows.Add($Finding) }
         }
-        $Script:ReportRows = $Rows.ToArray()
+        $Script:ReportRows = if ($Mode -eq 'AllEligible') {
+            @($Rows.ToArray() | Select-Object -Property GroupName, GroupId, Finding, Access, PrincipalName, UserPrincipalName, StartUtc, EndUtc)
+        } else { $Rows.ToArray() }
         foreach ($Row in $Script:ReportRows)
         {
             [void]$Script:ReportGrid.Rows.Add(@($Row.GroupName, $Row.GroupId, $Row.Finding, $Row.Access, $Row.PrincipalName, $Row.UserPrincipalName, $Row.PrincipalId, $Row.PrincipalType, $Row.StartUtc, $Row.EndUtc))
@@ -1535,6 +1574,50 @@ function Invoke-AssignmentReport
     }
 }
 
+function Write-AssignmentReportFile
+{
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][object[]]$Rows)
+
+    $Extension = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
+    if ($Extension -notin @('.csv', '.xlsx')) { throw 'Choose a .csv or .xlsx report file.' }
+    if ($Extension -eq '.xlsx')
+    {
+        if (-not (Get-Module -ListAvailable -Name ImportExcel))
+        {
+            throw 'ImportExcel is required for XLSX export. Install it with: Install-Module ImportExcel -Scope CurrentUser'
+        }
+        Import-Module ImportExcel -ErrorAction Stop
+    }
+    $SafeRows = foreach ($Row in $Rows)
+    {
+        $Safe = [ordered]@{}
+        foreach ($Property in $Row.PSObject.Properties)
+        {
+            $Value = [string]$Property.Value
+            if ($Value -match '^[\s]*[=+\-@]' -or $Value -match '^[\t\r\n]') { $Value = "'" + $Value }
+            $Safe[$Property.Name] = $Value
+        }
+        [PSCustomObject]$Safe
+    }
+    $TempPath = Join-Path ([System.IO.Path]::GetDirectoryName($Path)) ('.PIM-Assignment-Report-' + [guid]::NewGuid().ToString() + $Extension)
+    try
+    {
+        if ($Extension -eq '.csv')
+        {
+            $SafeRows | Export-Csv -LiteralPath $TempPath -NoTypeInformation -Encoding UTF8
+        }
+        else
+        {
+            $SafeRows | Export-Excel -Path $TempPath -WorksheetName 'Assignments' -AutoSize -FreezeTopRow -AutoFilter -NoNumberConversion '*' -NoHyperLinkConversion '*'
+        }
+        Move-Item -LiteralPath $TempPath -Destination $Path -Force -ErrorAction Stop
+    }
+    finally
+    {
+        if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -ErrorAction Stop }
+    }
+}
+
 function Export-AssignmentReport
 {
     if ($Script:ReportRows.Count -eq 0) { throw 'Run a report with findings before exporting.' }
@@ -1542,23 +1625,14 @@ function Export-AssignmentReport
     try
     {
         $Dialog.Title = 'Export assignment report'
-        $Dialog.Filter = 'CSV files (*.csv)|*.csv'
-        $Dialog.DefaultExt = 'csv'
+        $ExcelAvailable = [bool](Get-Module -ListAvailable -Name ImportExcel)
+        $Dialog.Filter = if ($ExcelAvailable) { 'Excel workbook (*.xlsx)|*.xlsx|CSV files (*.csv)|*.csv' } else { 'CSV files (*.csv)|*.csv|Excel workbook (*.xlsx)|*.xlsx' }
+        $Dialog.DefaultExt = if ($ExcelAvailable) { 'xlsx' } else { 'csv' }
         $Dialog.AddExtension = $true
-        $Dialog.FileName = 'PIM-Assignment-Report.csv'
+        $Dialog.OverwritePrompt = $true
+        $Dialog.FileName = "$(Get-Date -Format 'yyyy-MM-dd_HHmm')-PIM-Assignment-Report"
         if ($Dialog.ShowDialog($Script:MainForm) -ne [System.Windows.Forms.DialogResult]::OK) { return }
-        $SafeRows = foreach ($Row in $Script:ReportRows)
-        {
-            $Safe = [ordered]@{}
-            foreach ($Property in $Row.PSObject.Properties)
-            {
-                $Value = [string]$Property.Value
-                if ($Value -match '^[\s]*[=+\-@]' -or $Value -match '^[\t\r\n]') { $Value = "'" + $Value }
-                $Safe[$Property.Name] = $Value
-            }
-            [PSCustomObject]$Safe
-        }
-        $SafeRows | Export-Csv -LiteralPath $Dialog.FileName -NoTypeInformation -Encoding UTF8
+        Write-AssignmentReportFile -Path $Dialog.FileName -Rows @($Script:ReportRows)
         Write-UiLog "Assignment report exported to '$($Dialog.FileName)' ($($Script:ReportRows.Count) findings)."
     }
     finally { $Dialog.Dispose() }
@@ -2456,7 +2530,7 @@ foreach ($Column in @('GroupName', 'GroupId', 'Finding', 'Access', 'PrincipalNam
 }
 $ReportTab.Controls.Add($Script:ReportGrid)
 $Script:ReportExportButton = New-Object System.Windows.Forms.Button
-$Script:ReportExportButton.Text = 'Export results to CSV'
+$Script:ReportExportButton.Text = 'Export results'
 $Script:ReportExportButton.Location = New-Object System.Drawing.Point(755, 545)
 $Script:ReportExportButton.Size = New-Object System.Drawing.Size(200, 36)
 $Script:ReportExportButton.Anchor = 'Bottom, Right'

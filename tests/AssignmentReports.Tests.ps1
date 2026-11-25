@@ -4,7 +4,8 @@ $ParseErrors = $null
 $Ast = [System.Management.Automation.Language.Parser]::ParseFile($ScriptPath, [ref]$null, [ref]$ParseErrors)
 if ($ParseErrors) { throw ($ParseErrors | Out-String) }
 $Names = @('Get-GraphCollection', 'Get-ReportGroups', 'Get-GroupReportInstances',
-    'Test-CurrentReportInstance', 'New-AssignmentReportRow', 'Get-EligibleReportRows', 'Get-PermanentReportRows')
+    'Test-CurrentReportInstance', 'New-AssignmentReportRow', 'Get-EligibleReportRows', 'Get-PermanentReportRows',
+    'Test-ReportAssignmentScope', 'Write-AssignmentReportFile')
 foreach ($Name in $Names)
 {
     $Function = $Ast.Find({ param($Node) $Node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $Node.Name -eq $Name }, $true)
@@ -74,4 +75,49 @@ catch { if ($_.Exception.Message -notmatch 'Unknown PIM assignment type') { thro
 $Script:Responses[$EligibilityUri].value[0].Remove('endDateTime')
 try { @(Get-EligibleReportRows -Group $Group -Now $Now) | Out-Null; throw 'Missing expiration was accepted.' }
 catch { if ($_.Exception.Message -notmatch 'without its principal') { throw } }
+
+$Script:ReportScope = 'PrivilegedAssignmentSchedule.Read.AzureADGroup'
+Assert-True (Test-ReportAssignmentScope @{ Scopes = @($Script:ReportScope) }) 'Read permission should permit the scan.'
+Assert-True (Test-ReportAssignmentScope @{ Scopes = @('PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup') }) 'ReadWrite permission should permit the scan.'
+Assert-True (-not (Test-ReportAssignmentScope @{ Scopes = @('User.Read') })) 'Missing permission should not permit the scan.'
+
+$TestDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('PimReportTest-' + [guid]::NewGuid().ToString())
+[void](New-Item -ItemType Directory -Path $TestDirectory)
+$CsvPath = Join-Path $TestDirectory 'report.csv'
+$ExcelPath = Join-Path $TestDirectory 'report.xlsx'
+try
+{
+    $Rows = @([pscustomobject][ordered]@{ GroupName = '=danger'; PrincipalName = 'Sample'; GroupId = '00123' })
+    Write-AssignmentReportFile -Path $CsvPath -Rows $Rows
+    $Csv = @(Import-Csv -LiteralPath $CsvPath)
+    Assert-True ($Csv.Count -eq 1 -and $Csv[0].GroupName -eq "'=danger" -and $Csv[0].GroupId -eq '00123') 'CSV export must protect formulas and preserve text.'
+    $Rows[0].PrincipalName = 'Updated'
+    Write-AssignmentReportFile -Path $CsvPath -Rows $Rows
+    Assert-True ((Import-Csv -LiteralPath $CsvPath).PrincipalName -eq 'Updated') 'CSV overwrite should replace the previous report.'
+    if (Get-Module -ListAvailable -Name ImportExcel)
+    {
+        Write-AssignmentReportFile -Path $ExcelPath -Rows $Rows
+        $Excel = @(Import-Excel -Path $ExcelPath -WorksheetName 'Assignments')
+        Assert-True ($Excel.Count -eq 1 -and $Excel[0].GroupName -eq "'=danger" -and $Excel[0].GroupId -eq '00123') 'Excel export must protect formulas and preserve text.'
+        $Package = Open-ExcelPackage -Path $ExcelPath
+        try { Assert-True ([string]::IsNullOrWhiteSpace($Package.Workbook.Worksheets['Assignments'].Cells['A2'].Formula)) 'Excel cell must not be a formula.' }
+        finally { Close-ExcelPackage -ExcelPackage $Package -NoSave }
+        $Rows[0].PrincipalName = 'Replaced'
+        Write-AssignmentReportFile -Path $ExcelPath -Rows $Rows
+        Assert-True ((Import-Excel -Path $ExcelPath -WorksheetName 'Assignments').PrincipalName -eq 'Replaced') 'Excel overwrite should replace the previous report.'
+    }
+    function Get-Module { param($Name, [switch]$ListAvailable) return $null }
+    try
+    {
+        try { Write-AssignmentReportFile -Path $ExcelPath -Rows $Rows; throw 'Missing ImportExcel was accepted.' }
+        catch { if ($_.Exception.Message -notmatch 'ImportExcel is required') { throw } }
+    }
+    finally { Remove-Item -LiteralPath 'Function:\Get-Module' }
+}
+finally
+{
+    if (Test-Path -LiteralPath $CsvPath) { Remove-Item -LiteralPath $CsvPath }
+    if (Test-Path -LiteralPath $ExcelPath) { Remove-Item -LiteralPath $ExcelPath }
+    Remove-Item -LiteralPath $TestDirectory
+}
 Write-Output 'Assignment report tests passed.'
